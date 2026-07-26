@@ -73,7 +73,7 @@ Files and Folders**.
 
 | Component | Role |
 |---|---|
-| `Upload to PixelDrain Folder….workflow` | Automator service; runs `pixeldrain-upload-fs "$@"` |
+| `Upload to PixelDrain Folder….workflow` | Automator service; Finder passes the selection on **stdin** (one path per line) and the action's wrapper rebuilds the argument list before running `pixeldrain-upload-fs`. Using stdin instead of "as arguments" keeps large selections in a single run — "as arguments" batches many items into multiple invocations. |
 | `bin/pixeldrain-upload-fs` | zsh orchestrator: auth, folder navigation, copy/move, recursive per-file upload, skip-by-size, retries, progress/pause/cancel plumbing |
 | `bin/pixeldrain-put` | Python helper: streaming upload (`fs`/`file`) and directory listing (`list`, with sizes) |
 | `bin/pixeldrain-progress` | floating progress window (Swift/AppKit), built from `src/pixeldrain-progress.swift` |

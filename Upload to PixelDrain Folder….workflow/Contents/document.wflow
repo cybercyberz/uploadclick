@@ -59,11 +59,11 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>"$HOME/.local/bin/pixeldrain-upload-fs" "$@" &#10;exit 0</string>
+					<string>args=()&#10;while IFS= read -r line; do&#10;  [[ -n "$line" ]] &amp;&amp; args+=("$line")&#10;done&#10;"$HOME/.local/bin/pixeldrain-upload-fs" "${args[@]}"&#10;exit 0</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>
-					<integer>1</integer>
+					<integer>0</integer>
 					<key>shell</key>
 					<string>/bin/zsh</string>
 					<key>source</key>
