@@ -1,9 +1,10 @@
 #!/bin/zsh
 # Upload files/folders into a chosen directory of the PixelDrain Filesystem
-# (pixeldrain.com/d/me, a Pro feature). Finder-style navigation: each dialog
-# shows one directory; double-click a folder to open it, "Go Up One Level" to
-# go back, "New Folder Here…" to create one, "Upload to This Folder" to pick the
-# current one.
+# (pixeldrain.com/d/me, a Pro feature). A native picker window (pixeldrain-picker,
+# an NSBrowser column view) handles Finder-style navigation: open a folder and a
+# new column slides in, "New Folder…" and "Copy/Move" appear as in-window sheets.
+# This script is the controller — it lists directories for the picker over a
+# coprocess and does the actual uploading; the picker is a pure view.
 #
 # Folders are uploaded file-by-file, recreating the folder tree on PixelDrain
 # (make_parents), so the progress window can show each file as it goes up and
@@ -22,6 +23,7 @@ trap '' PIPE
 
 KEY_FILE="$HOME/.pixeldrain_api_key"
 UI_BIN="$HOME/.local/bin/pixeldrain-progress"
+PICK_BIN="$HOME/.local/bin/pixeldrain-picker"
 PUT_BIN="$HOME/.local/bin/pixeldrain-put"
 
 notify() {
@@ -53,6 +55,18 @@ ui_done()      { ui "DONE $1";     (( ui_active )) && exec 3>&-; ui_active=0 }
 ui_done_hold() { ui "DONEHOLD $1"; (( ui_active )) && exec 3>&-; ui_active=0 }
 ui_quit()      { (( ui_active )) && exec 3>&-; ui_active=0 }
 
+# ---- destination picker (native NSBrowser window; two-way via a coprocess) ----
+# The picker is a pure view: we send it directory listings and it sends back the
+# folder the user chose. print -p / read -p talk to the coprocess.
+picker_active=0
+picker_open() {
+  if [[ -x "$PICK_BIN" ]]; then
+    coproc "$PICK_BIN"
+    picker_active=1
+  fi
+}
+pk() { (( picker_active )) && print -rp -- "$1" 2>/dev/null }
+
 # Block while the UI has raised the pause flag. Checked at each file boundary.
 pause_gate() {
   local announced=0
@@ -62,16 +76,24 @@ pause_gate() {
   done
 }
 
-# Error path: close the progress window, then show a blocking alert.
-# The alert keeps the workflow process alive until dismissed; the window
-# would be killed the moment the script exits.
+# Error path. While the picker is up, show the message inside it (a sheet) and
+# wait for the user to dismiss it — the picker closes its end of the pipe, which
+# we detect as EOF, so there is no second alert. Otherwise (progress-window phase
+# or no UI yet) fall back to a blocking osascript alert, which keeps the workflow
+# process alive until dismissed.
 die() {
-  if (( ui_active )); then
-    exec 3>&-
-    ui_active=0
+  if (( picker_active )); then
+    pk "ERROR $1"
+    while IFS= read -rp _ 2>/dev/null; do :; done   # drain until the picker exits
+    picker_active=0
+  else
+    if (( ui_active )); then
+      exec 3>&-
+      ui_active=0
+    fi
+    alert "$1"
   fi
   [[ -n "${ctldir:-}" ]] && /bin/rm -rf "$ctldir"
-  alert "$1"
   exit 1
 }
 
@@ -88,9 +110,10 @@ ctldir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain-ctl.XXXXXX")"
 pausefile="$ctldir/pause"
 print -rn -- 0 > "$pausefile"
 
-ui_open
-ui "TITLE Uploading $total_items $noun to the PixelDrain Filesystem"
-ui "STATUS Reading API key…"
+# Open the destination picker first; it shows a spinner + these status lines
+# while we preflight, then swaps to the folder browser once listings arrive.
+picker_open
+pk "STATUS Reading API key…"
 
 [[ -s "$KEY_FILE" ]] || die "No API key found. Save your key to ~/.pixeldrain_api_key and try again."
 API_KEY="$(/usr/bin/tr -d '[:space:]' < "$KEY_FILE")"
@@ -126,12 +149,12 @@ trap cancel_handler TERM INT
 # Preflight the Python dependency up front. On a Mac without Command Line Tools,
 # /usr/bin/python3 pops a system install prompt; catching it here avoids that
 # surprise mid-upload.
-ui "STATUS Checking prerequisites…"
+pk "STATUS Checking prerequisites…"
 if ! /usr/bin/python3 --version >/dev/null 2>&1; then
   die "This action needs the macOS Command Line Tools (python3). Open Terminal, run:  xcode-select --install  and try again once it finishes."
 fi
 
-ui "STATUS Contacting pixeldrain.com…"
+pk "STATUS Contacting pixeldrain.com…"
 # Auth via a curl config read from stdin (print is a shell builtin, so the key
 # never appears in any process's argument list).
 api_check() {
@@ -145,7 +168,7 @@ while true; do
   [[ "$api_code" == 200 || "$api_code" == 4* ]] && break
   (( attempt >= 3 )) && break
   (( attempt++ ))
-  ui "STATUS PixelDrain not responding (HTTP $api_code). Retrying ($attempt of 3)…"
+  pk "STATUS PixelDrain not responding (HTTP $api_code). Retrying ($attempt of 3)…"
   /bin/sleep 2
 done
 case "$api_code" in
@@ -175,105 +198,78 @@ pd_list() {
   done < <("$PUT_BIN" list "$1")
 }
 
-# Ask for a new folder name; prints the trimmed name, or empty if cancelled/blank.
-prompt_new_folder() {
-  local name
-  name="$(/usr/bin/osascript \
-    -e 'tell application "System Events" to activate' \
-    -e 'set r to display dialog "New folder name:" default answer "" with title "PixelDrain" buttons {"Cancel", "Create"} default button "Create"' \
-    -e 'text returned of r' 2>/dev/null)" || { print -r -- ""; return }
-  name="${name//\//}"                          # slashes would break the path
-  name="${name#"${name%%[![:space:]]*}"}"      # strip leading whitespace
-  name="${name%"${name##*[![:space:]]}"}"      # strip trailing whitespace
-  print -r -- "$name"
-}
+# ---- navigation, driven by the native picker window ----
+# The picker requests a folder's contents (LIST <path>); we stream them back as
+# BEGIN/DIR/FILE/END. It sends CHOOSE <mode> <path> once the user confirms a
+# destination (New Folder and Copy/Move are its own in-window sheets), or CANCEL.
+(( picker_active )) || die "The destination picker component is missing. Re-run install.sh."
 
-UPLOAD_HERE="Upload to This Folder"
-NEW_FOLDER="＋ New Folder Here…"
-GO_UP="Go Up One Level"
-
-# ---- Finder-style navigation loop ----
-current="me"
 dest=""
-while true; do
-  ui "STATUS Loading folder list…"
-  ui "PROGRESS ind"
-  pd_list "$current"
-  attempt=1
-  # Retry only transient failures (network / 5xx); 4xx won't fix on retry.
-  while [[ -n "$LIST_ERR" ]] && (( attempt < 3 )); do
-    case "$LIST_ERR" in network|5*) ;; *) break ;; esac
-    (( attempt++ ))
-    ui "STATUS Server error while listing folders. Retrying ($attempt of 3)…"
-    /bin/sleep 2
-    pd_list "$current"
-  done
-  if [[ -n "$LIST_ERR" ]]; then
-    case "$LIST_ERR" in
-      401|402|403) die "Access to the PixelDrain Filesystem was denied (HTTP $LIST_ERR). This feature requires an active Pro subscription." ;;
-      404)         die "Folder not found on PixelDrain (HTTP 404)." ;;
-      5*)          die "PixelDrain server error while listing folders (HTTP $LIST_ERR). The service is temporarily unavailable. Try again later." ;;
-      network)     die "Unable to reach pixeldrain.com while listing folders. Check your network connection." ;;
-      *)           die "Unable to list the PixelDrain Filesystem (error: $LIST_ERR)." ;;
-    esac
+mode=""
+while (( picker_active )); do
+  if ! IFS= read -rp cmdline 2>/dev/null; then
+    # Picker closed its pipe without a decision → treat as cancel.
+    picker_active=0
+    /bin/rm -rf "$ctldir"
+    exit 0
   fi
-
-  typeset -a entries
-  entries=("$UPLOAD_HERE" "$NEW_FOLDER")
-  [[ "$current" != "me" ]] && entries+=("$GO_UP")
-  # Subfolders carry a trailing slash so they are distinguishable from the
-  # action rows above and from files.
-  for name in "${LIST_DIRS[@]}"; do
-    [[ -z "$name" ]] && continue
-    entries+=("$name/")
-  done
-
-  if [[ "$current" == "me" ]]; then disp="/"; else disp="/${current#me/}"; fi
-  ui "STATUS Waiting for destination selection (${disp})…"
-
-  # Note: "OK button name" takes no "with" keyword. Adding one is a syntax
-  # error, which makes osascript exit non-zero with no output.
-  choice="$(/usr/bin/osascript \
-    -e 'on run argv' \
-    -e 'set thePrompt to item 1 of argv' \
-    -e 'set L to rest of argv' \
-    -e 'tell application "System Events" to activate' \
-    -e 'set r to choose from list L with title "PixelDrain" with prompt thePrompt default items {item 1 of L} OK button name "Choose" cancel button name "Cancel"' \
-    -e 'if r is false then return "CANCELLED"' \
-    -e 'return item 1 of r' \
-    -e 'end run' -- "Current folder: ${disp}
-Double-click a folder to open it." "${entries[@]}")" \
-    || die "Unable to display the destination picker. AppleScript reported an error."
-
-  case "$choice" in
-    CANCELLED)      ui_quit; /bin/rm -rf "$ctldir"; exit 0 ;;
-    "")             die "The destination picker returned no selection." ;;
-    "$UPLOAD_HERE") dest="$current"; break ;;
-    "$NEW_FOLDER")
-      newname="$(prompt_new_folder)"
-      [[ -z "$newname" ]] && continue   # cancelled or blank → back to the list
-      dest="$current/$newname"; break ;;
-    "$GO_UP")       current="${current:h}" ;;
-    */)             current="$current/${choice%/}" ;;
-    *)              die "Unrecognised selection: $choice" ;;
+  verb="${cmdline%%[[:space:]]*}"
+  case "$verb" in
+    LIST)
+      lpath="${cmdline#LIST }"
+      pd_list "$lpath"
+      attempt=1
+      # Retry only transient failures (network / 5xx); 4xx won't fix on retry.
+      while [[ -n "$LIST_ERR" ]] && (( attempt < 3 )); do
+        case "$LIST_ERR" in network|5*) ;; *) break ;; esac
+        (( attempt++ ))
+        pk "STATUS Server error while listing folders. Retrying ($attempt of 3)…"
+        /bin/sleep 2
+        pd_list "$lpath"
+      done
+      if [[ -n "$LIST_ERR" ]]; then
+        case "$LIST_ERR" in
+          401|402|403) die "Access to the PixelDrain Filesystem was denied (HTTP $LIST_ERR). This feature requires an active Pro subscription." ;;
+          404)         die "Folder not found on PixelDrain (HTTP 404)." ;;
+          5*)          die "PixelDrain server error while listing folders (HTTP $LIST_ERR). The service is temporarily unavailable. Try again later." ;;
+          network)     die "Unable to reach pixeldrain.com while listing folders. Check your network connection." ;;
+          *)           die "Unable to list the PixelDrain Filesystem (error: $LIST_ERR)." ;;
+        esac
+      fi
+      pk "BEGIN $lpath"
+      for name in "${LIST_DIRS[@]}";  do [[ -n "$name" ]] && pk "DIR $name";  done
+      for name in "${LIST_FILES[@]}"; do [[ -n "$name" ]] && pk "FILE $name"; done
+      pk "END $lpath"
+      ;;
+    CHOOSE)
+      rest="${cmdline#CHOOSE }"
+      mode="${rest%%[[:space:]]*}"   # copy | move
+      dest="${rest#* }"              # remote path (may contain spaces)
+      break
+      ;;
+    CANCEL)
+      picker_active=0
+      /bin/rm -rf "$ctldir"
+      exit 0
+      ;;
+    *) : ;;   # ignore anything unexpected
   esac
 done
 
+# Destination chosen — dismiss the picker and hand off to the progress window.
+pk "CLOSE"
+picker_active=0
+
+case "$mode" in
+  copy|move) ;;
+  *) /bin/rm -rf "$ctldir"; exit 0 ;;   # defensive: no valid mode → bail cleanly
+esac
+
 if [[ "$dest" == "me" ]]; then dest_label="/"; else dest_label="/${dest#me/}"; fi
 
-# ---- Copy or Move? ----
-mode="$(/usr/bin/osascript \
-  -e 'on run argv' \
-  -e 'tell application "System Events" to activate' \
-  -e 'set dlg to "Upload into " & (item 1 of argv) & "?" & return & return & "Copy keeps the originals. Move deletes each local file after it uploads. In both modes, files already in the destination with the same name and size are skipped (Move leaves those on disk)."' \
-  -e 'set r to display dialog dlg with title "PixelDrain" buttons {"Cancel", "Move", "Copy"} default button "Copy"' \
-  -e 'button returned of r' \
-  -e 'end run' -- "$dest_label" 2>/dev/null)" || { ui_quit; /bin/rm -rf "$ctldir"; exit 0; }
-case "$mode" in
-  Copy) mode=copy ;;
-  Move) mode=move ;;
-  *)    ui_quit; /bin/rm -rf "$ctldir"; exit 0 ;;
-esac
+# The picker owned the setup UI; now open the floating progress window for the
+# upload itself (per-file status, overall %, Pause/Resume, Cancel).
+ui_open
 
 [[ "$mode" == move ]] && mode_title="Moving" || mode_title="Copying"
 ui "TITLE $mode_title to ${dest_label}"

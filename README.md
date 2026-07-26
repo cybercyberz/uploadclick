@@ -3,9 +3,9 @@
 A macOS Finder **Quick Action** that uploads any selected files or folders into
 a directory of your choice in the [PixelDrain Filesystem](https://pixeldrain.com/d/me).
 Right-click → **Quick Actions → Upload to PixelDrain Folder…**, browse to a
-destination folder (Finder-style), and the files stream up with a floating
-progress window. The destination folder's share link is copied to your
-clipboard when the upload finishes.
+destination in a native column-view window (like Finder), and the files stream
+up with a floating progress window. The destination folder's share link is
+copied to your clipboard when the upload finishes.
 
 Folders are uploaded **file-by-file**, recreating the folder tree on PixelDrain,
 so the progress window names each file as it goes up. After you pick a
@@ -23,7 +23,7 @@ you click **Close**; a quick single small file auto-closes.
 
 ## Requirements
 
-- macOS (Apple Silicon — the progress UI is an arm64 binary).
+- macOS (Apple Silicon — the picker and progress windows are arm64 binaries).
 - An **active PixelDrain Pro subscription** — the Filesystem feature it uploads
   into is Pro-only.
 - A PixelDrain **API key** saved at `~/.pixeldrain_api_key`.
@@ -55,12 +55,12 @@ Files and Folders**.
 
 1. Select one or more files/folders in Finder.
 2. Right-click → **Quick Actions → Upload to PixelDrain Folder…**
-3. Navigate to a destination:
-   - a **folder/** row opens that folder,
-   - **Go Up One Level** goes back,
-   - **＋ New Folder Here…** creates a subfolder,
-   - **Upload to This Folder** picks the current one.
-4. Choose **Copy** or **Move**. Move deletes each local file after it uploads;
+3. A native **column-view window** opens. Navigate to a destination:
+   - click a folder and its contents slide in as a new column to the right
+     (files show dimmed — only folders can be picked),
+   - **New Folder…** opens a sheet to name a new subfolder,
+   - **Upload…** confirms the currently selected folder as the destination.
+4. In the confirmation sheet choose **Copy** or **Move**. Move deletes each local file after it uploads;
    files already present with the same name and size are skipped and (in Move)
    left on disk.
 5. Watch the progress window — it shows the current file, per-file percent, and
@@ -74,7 +74,8 @@ Files and Folders**.
 | Component | Role |
 |---|---|
 | `Upload to PixelDrain Folder….workflow` | Automator service; Finder passes the selection on **stdin** (one path per line) and the action's wrapper rebuilds the argument list before running `pixeldrain-upload-fs`. Using stdin instead of "as arguments" keeps large selections in a single run — "as arguments" batches many items into multiple invocations. |
-| `bin/pixeldrain-upload-fs` | zsh orchestrator: auth, folder navigation, copy/move, recursive per-file upload, skip-by-size, retries, progress/pause/cancel plumbing |
+| `bin/pixeldrain-upload-fs` | zsh orchestrator: auth, directory listing for the picker, copy/move, recursive per-file upload, skip-by-size, retries, progress/pause/cancel plumbing |
+| `bin/pixeldrain-picker` | native destination-folder picker — an NSBrowser (Finder column view) window (Swift/AppKit), built from `src/pixeldrain-picker.swift`. Pure view: the orchestrator streams it listings over a coprocess and it returns the chosen folder + Copy/Move |
 | `bin/pixeldrain-put` | Python helper: streaming upload (`fs`/`file`) and directory listing (`list`, with sizes) |
 | `bin/pixeldrain-progress` | floating progress window (Swift/AppKit), built from `src/pixeldrain-progress.swift` |
 
@@ -82,13 +83,17 @@ The API key is read from `~/.pixeldrain_api_key` and passed to the helpers via
 the `PD_AUTH_KEY` environment variable — never on a command line, so it can't
 leak through `ps`.
 
-### Progress window & Cancel
+### Picker & progress windows
 
-`bin/pixeldrain-progress` is compiled from `src/pixeldrain-progress.swift` with:
+Both AppKit windows are compiled from `src/` with a single command:
 
 ```sh
-./build.sh          # xcrun swiftc -O -o bin/pixeldrain-progress src/…
+./install.sh build  # xcrun swiftc -O → bin/pixeldrain-picker and bin/pixeldrain-progress
 ```
+
+The **picker** (`pixeldrain-picker`) is the destination browser; the orchestrator
+drives it over a coprocess, sending `BEGIN`/`DIR`/`FILE`/`END` listings and
+receiving `LIST <path>` requests and a final `CHOOSE <copy|move> <path>`.
 
 The orchestrator drives it over a one-line-per-message stdin protocol:
 `TITLE <t>`, `STATUS <s>`, `PROGRESS <0-100>` / `PROGRESS ind`,
