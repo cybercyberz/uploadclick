@@ -2,24 +2,32 @@
 // Folder…" Quick Action.
 //
 // Reads a one-line-per-message protocol on stdin and updates a floating panel:
-//   TITLE  <text>          window title line
-//   STATUS <text>          status line
+//   TITLE    <text>        window title line
+//   STATUS   <text>        status line
 //   PROGRESS <0-100>       determinate progress
 //   PROGRESS ind           indeterminate (animated) progress
-//   DONE   <text>          completion message; window lingers briefly then closes
-// stdin EOF closes the window.
+//   DONE     <text>        completion message; window lingers ~4s then closes
+//   DONEHOLD <text>        completion message; window stays open until Close
+// stdin EOF closes the window (unless a completion message is showing).
 //
-// Cancel back-channel: the orchestrator PID is passed as argv[1]. Clicking
-// Cancel (or the window close button / Esc) sends SIGTERM to that PID; the
-// orchestrator traps it, aborts the in-flight upload, cleans up, and closes its
-// end of the pipe — which reaches us as stdin EOF and we exit. This coordinated
-// shutdown is why Cancel waits for EOF rather than vanishing on its own.
+// Args: argv[1] = orchestrator PID (Cancel back-channel), argv[2] = pause-file
+// path (optional).
+//
+// Cancel back-channel: clicking Cancel (or the window close button / Esc) sends
+// SIGTERM to the orchestrator PID; it traps it, aborts the in-flight upload,
+// cleans up, and closes its end of the pipe — which reaches us as stdin EOF and
+// we exit. This coordinated shutdown is why Cancel waits for EOF.
+//
+// Pause back-channel: the Pause button toggles the pause file between "1" and
+// "0". The orchestrator polls it at each file boundary and holds/resumes.
 
 import Cocoa
 import Darwin
 
 let parentPID: pid_t = CommandLine.arguments.count > 1
     ? (pid_t(CommandLine.arguments[1]) ?? 0) : 0
+let pausePath: String? = CommandLine.arguments.count > 2
+    ? CommandLine.arguments[2] : nil
 
 func makeLabel(bold: Bool) -> NSTextField {
     let f = NSTextField()
@@ -38,13 +46,15 @@ final class ProgressController: NSObject, NSApplicationDelegate, NSWindowDelegat
     let titleLabel = makeLabel(bold: true)
     let statusLabel = makeLabel(bold: false)
     let bar = NSProgressIndicator()
+    let pauseButton = NSButton(title: "Pause", target: nil, action: nil)
     let button = NSButton(title: "Cancel", target: nil, action: nil)
 
-    var finished = false     // DONE received
+    var finished = false     // DONE / DONEHOLD received
     var cancelling = false
+    var paused = false
 
     override init() {
-        let w: CGFloat = 460, h: CGFloat = 150
+        let w: CGFloat = 520, h: CGFloat = 150
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                         styleMask: [.titled, .closable, .nonactivatingPanel],
                         backing: .buffered, defer: false)
@@ -66,14 +76,20 @@ final class ProgressController: NSObject, NSApplicationDelegate, NSWindowDelegat
         statusLabel.maximumNumberOfLines = 2
         statusLabel.stringValue = "Starting…"
 
-        bar.frame = NSRect(x: 20, y: 30, width: 320, height: 20)
+        bar.frame = NSRect(x: 20, y: 30, width: 290, height: 20)
         bar.style = .bar
         bar.isIndeterminate = true
         bar.minValue = 0
         bar.maxValue = 100
         bar.startAnimation(nil)
 
-        button.frame = NSRect(x: 350, y: 24, width: 90, height: 32)
+        pauseButton.frame = NSRect(x: 320, y: 24, width: 85, height: 32)
+        pauseButton.bezelStyle = .rounded
+        pauseButton.target = self
+        pauseButton.action = #selector(pauseClicked)
+        pauseButton.isHidden = (pausePath == nil)
+
+        button.frame = NSRect(x: 415, y: 24, width: 85, height: 32)
         button.bezelStyle = .rounded
         button.target = self
         button.action = #selector(cancelClicked)
@@ -82,6 +98,7 @@ final class ProgressController: NSObject, NSApplicationDelegate, NSWindowDelegat
         content.addSubview(titleLabel)
         content.addSubview(statusLabel)
         content.addSubview(bar)
+        content.addSubview(pauseButton)
         content.addSubview(button)
     }
 
@@ -128,26 +145,44 @@ final class ProgressController: NSObject, NSApplicationDelegate, NSWindowDelegat
                 bar.doubleValue = min(100, max(0, v))
             }
         case "DONE":
-            finished = true
-            cancelling = false
-            bar.stopAnimation(nil)
-            bar.isIndeterminate = false
-            bar.doubleValue = 100
-            statusLabel.stringValue = rest
-            button.title = "Close"
-            button.isEnabled = true
-            button.keyEquivalent = "\r"
-            // Linger briefly so the message is readable, then close.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { NSApp.terminate(nil) }
+            complete(rest, hold: false)
+        case "DONEHOLD":
+            complete(rest, hold: true)
         default:
             break
         }
     }
 
+    func complete(_ msg: String, hold: Bool) {
+        finished = true
+        cancelling = false
+        bar.stopAnimation(nil)
+        bar.isIndeterminate = false
+        bar.doubleValue = 100
+        statusLabel.stringValue = msg
+        pauseButton.isHidden = true
+        button.title = "Close"
+        button.isEnabled = true
+        button.keyEquivalent = "\r"
+        // Small uploads auto-close after a readable pause; big ones (hold) stay
+        // open until the user clicks Close.
+        if !hold {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { NSApp.terminate(nil) }
+        }
+    }
+
     func stdinClosed() {
-        // DONE schedules its own close; let that grace period run.
+        // A completion message schedules/awaits its own close; let it stand.
         if finished { return }
         NSApp.terminate(nil)
+    }
+
+    // ---- pause ----
+    @objc func pauseClicked() {
+        guard let path = pausePath, !finished, !cancelling else { return }
+        paused.toggle()
+        try? (paused ? "1" : "0").write(toFile: path, atomically: true, encoding: .utf8)
+        pauseButton.title = paused ? "Resume" : "Pause"
     }
 
     // ---- cancel ----
@@ -159,6 +194,7 @@ final class ProgressController: NSObject, NSApplicationDelegate, NSWindowDelegat
         guard !cancelling else { return }
         cancelling = true
         button.isEnabled = false
+        pauseButton.isHidden = true
         statusLabel.stringValue = "Cancelling…"
         bar.isIndeterminate = true
         bar.startAnimation(nil)

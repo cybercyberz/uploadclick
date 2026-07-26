@@ -18,7 +18,7 @@ Upload modes print, one per line:
 
 list prints, one per line:
   DIR  <name>                a subdirectory
-  FILE <name>                a file
+  FILE <size> <name>         a file and its size in bytes
   HTTPERROR <code|network>   on failure (code is the HTTP status)
 """
 import http.client
@@ -74,13 +74,14 @@ def do_list(path):
         key=str.lower,
     )
     files = sorted(
-        (c["name"] for c in children if c.get("type") != "dir" and c.get("name")),
-        key=str.lower,
+        ((c["name"], int(c.get("file_size") or 0))
+         for c in children if c.get("type") != "dir" and c.get("name")),
+        key=lambda t: t[0].lower(),
     )
     for n in dirs:
         emit(f"DIR {n}")
-    for n in files:
-        emit(f"FILE {n}")
+    for n, sz in files:
+        emit(f"FILE {sz} {n}")
 
 
 def do_upload(mode, local_file, remote):

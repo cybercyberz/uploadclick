@@ -7,10 +7,19 @@ destination folder (Finder-style), and the files stream up with a floating
 progress window. The destination folder's share link is copied to your
 clipboard when the upload finishes.
 
-Local folders are zipped (`ditto`) before upload. When a name already exists in
-the destination you're asked to Overwrite or Skip. The progress window has a
-**Cancel** button that aborts an in-flight upload and removes the partial file
-from PixelDrain.
+Folders are uploaded **file-by-file**, recreating the folder tree on PixelDrain,
+so the progress window names each file as it goes up. After you pick a
+destination you choose **Copy** (keep the originals) or **Move** (delete each
+local file once it uploads). In both modes a file that already exists in the
+destination with the **same name and size** is skipped — in Move it's left on
+disk. The window has a **Pause/Resume** button (pauses at the next file
+boundary) and a **Cancel** button that aborts the in-flight upload and removes
+its partial file from PixelDrain. Big uploads keep the result window open until
+you click **Close**; a quick single small file auto-closes.
+
+> Note: because folders upload file-by-file rather than as one archive, many
+> tiny files mean many requests (slower than a single zip would be), macOS
+> resource forks aren't preserved, and empty subfolders aren't recreated.
 
 ## Requirements
 
@@ -51,17 +60,22 @@ Files and Folders**.
    - **Go Up One Level** goes back,
    - **＋ New Folder Here…** creates a subfolder,
    - **Upload to This Folder** picks the current one.
-4. Watch the progress window. On success the folder link is on your clipboard.
-   Click **Cancel** any time to abort — the current upload is stopped and its
-   partial file is removed from PixelDrain.
+4. Choose **Copy** or **Move**. Move deletes each local file after it uploads;
+   files already present with the same name and size are skipped and (in Move)
+   left on disk.
+5. Watch the progress window — it shows the current file, per-file percent, and
+   overall progress. Use **Pause/Resume** to hold at the next file boundary, or
+   **Cancel** to abort (the in-flight file is stopped and its partial removed).
+   On success the folder link is on your clipboard; big uploads stay open until
+   you click **Close**.
 
 ## How it works
 
 | Component | Role |
 |---|---|
 | `Upload to PixelDrain Folder….workflow` | Automator service; runs `pixeldrain-upload-fs "$@"` |
-| `bin/pixeldrain-upload-fs` | zsh orchestrator: auth, folder navigation, zipping, retries, progress plumbing, cancel handling |
-| `bin/pixeldrain-put` | Python helper: streaming upload (`fs`/`file`) and directory listing (`list`) |
+| `bin/pixeldrain-upload-fs` | zsh orchestrator: auth, folder navigation, copy/move, recursive per-file upload, skip-by-size, retries, progress/pause/cancel plumbing |
+| `bin/pixeldrain-put` | Python helper: streaming upload (`fs`/`file`) and directory listing (`list`, with sizes) |
 | `bin/pixeldrain-progress` | floating progress window (Swift/AppKit), built from `src/pixeldrain-progress.swift` |
 
 The API key is read from `~/.pixeldrain_api_key` and passed to the helpers via
@@ -77,14 +91,21 @@ leak through `ps`.
 ```
 
 The orchestrator drives it over a one-line-per-message stdin protocol:
-`TITLE <t>`, `STATUS <s>`, `PROGRESS <0-100>` / `PROGRESS ind`, `DONE <msg>`;
-closing the stream closes the window.
+`TITLE <t>`, `STATUS <s>`, `PROGRESS <0-100>` / `PROGRESS ind`,
+`DONE <msg>` (auto-close after ~4s) / `DONEHOLD <msg>` (stay open until Close);
+closing the stream closes the window unless a completion message is showing.
 
-**Cancel back-channel:** the orchestrator passes its PID to the window
-(`pixeldrain-progress <pid>`). Clicking Cancel (or the window's close button)
-sends `SIGTERM` to that PID. The orchestrator traps it, kills the in-flight
-`pixeldrain-put`/`ditto`, `DELETE`s the partially-uploaded remote file, cleans
-up temp files, and exits — the window then closes when its stdin reaches EOF.
+The window is launched as `pixeldrain-progress <pid> <pause-file>`.
+
+**Cancel back-channel:** clicking Cancel (or the window's close button) sends
+`SIGTERM` to `<pid>`. The orchestrator traps it, kills the in-flight
+`pixeldrain-put`, `DELETE`s the partially-uploaded remote file, cleans up temp
+files, and exits — the window then closes when its stdin reaches EOF.
+
+**Pause back-channel:** the Pause button toggles `<pause-file>` between `1` and
+`0`. The orchestrator reads it at each file boundary and holds (or resumes)
+there. A file already mid-upload finishes first, so pausing a single large file
+takes effect once it ends.
 
 ## Troubleshooting
 

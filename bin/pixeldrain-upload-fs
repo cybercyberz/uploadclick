@@ -3,8 +3,17 @@
 # (pixeldrain.com/d/me, a Pro feature). Finder-style navigation: each dialog
 # shows one directory; double-click a folder to open it, "Go Up One Level" to
 # go back, "New Folder Here…" to create one, "Upload to This Folder" to pick the
-# current one. Local folders are zipped before upload.
-# Shows a floating progress window with live status and overall percentage.
+# current one.
+#
+# Folders are uploaded file-by-file, recreating the folder tree on PixelDrain
+# (make_parents), so the progress window can show each file as it goes up and
+# per-file skip/move can work. After picking a destination you choose Copy or
+# Move; Move deletes each local file once it uploads. In both modes a file that
+# already exists in the destination with the same name and size is skipped (in
+# Move it is left on disk).
+#
+# Shows a floating progress window with live status, per-file names, overall
+# byte-weighted percentage, a Pause/Resume button, and a Cancel button.
 # API key is read from ~/.pixeldrain_api_key and passed to the helpers via the
 # PD_AUTH_KEY environment variable (never on the command line, so it can't leak
 # through `ps`).
@@ -34,13 +43,25 @@ ui_active=0
 ui() { (( ui_active )) && { print -r -- "$1" >&3 2>/dev/null || ui_active=0 } }
 ui_open() {
   if [[ -x "$UI_BIN" ]]; then
-    # Pass our PID so the window's Cancel button can SIGTERM us back.
-    exec 3> >("$UI_BIN" $$)
+    # Pass our PID (Cancel → SIGTERM us) and the pause-control file the
+    # window's Pause button toggles.
+    exec 3> >("$UI_BIN" $$ "$pausefile")
     ui_active=1
   fi
 }
-ui_done() { ui "DONE $1"; (( ui_active )) && exec 3>&-; ui_active=0 }
-ui_quit() { (( ui_active )) && exec 3>&-; ui_active=0 }
+ui_done()      { ui "DONE $1";     (( ui_active )) && exec 3>&-; ui_active=0 }
+ui_done_hold() { ui "DONEHOLD $1"; (( ui_active )) && exec 3>&-; ui_active=0 }
+ui_quit()      { (( ui_active )) && exec 3>&-; ui_active=0 }
+
+# Block while the UI has raised the pause flag. Checked at each file boundary.
+pause_gate() {
+  local announced=0
+  while [[ "$(< "$pausefile")" == 1 ]]; do
+    (( announced )) || { ui "STATUS Paused — click Resume to continue"; ui "PROGRESS ind"; announced=1 }
+    /bin/sleep 0.3
+  done
+}
+
 # Error path: close the progress window, then show a blocking alert.
 # The alert keeps the workflow process alive until dismissed; the window
 # would be killed the moment the script exits.
@@ -49,6 +70,7 @@ die() {
     exec 3>&-
     ui_active=0
   fi
+  [[ -n "${ctldir:-}" ]] && /bin/rm -rf "$ctldir"
   alert "$1"
   exit 1
 }
@@ -61,6 +83,11 @@ fi
 total_items=$#
 noun="items"; (( total_items == 1 )) && noun="item"
 
+# ---- control dir: upload FIFO + the pause flag the UI toggles ----
+ctldir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain-ctl.XXXXXX")"
+pausefile="$ctldir/pause"
+print -rn -- 0 > "$pausefile"
+
 ui_open
 ui "TITLE Uploading $total_items $noun to the PixelDrain Filesystem"
 ui "STATUS Reading API key…"
@@ -71,10 +98,8 @@ export PD_AUTH_KEY="$API_KEY"
 
 # ---- cancellation state + handler ----
 # Populated as work proceeds so the Cancel handler can tear everything down.
-child_pid=""    # PID of the current killable child (pixeldrain-put / ditto)
+child_pid=""    # PID of the current killable child (pixeldrain-put)
 cur_remote=""   # remote path of the upload in flight (for partial cleanup)
-tmpdir=""       # holds zipped folders
-ctldir=""       # holds the upload FIFO
 
 # DELETE a Filesystem path. Cookie is passed via a stdin curl config (print is a
 # builtin), so the key never lands in argv.
@@ -92,7 +117,6 @@ cancel_handler() {
   trap '' TERM INT
   [[ -n "$child_pid" ]] && kill "$child_pid" 2>/dev/null
   [[ -n "$cur_remote" ]] && pd_delete "$cur_remote"
-  [[ -n "$tmpdir" ]] && /bin/rm -rf "$tmpdir"
   [[ -n "$ctldir" ]] && /bin/rm -rf "$ctldir"
   ui_quit
   exit 0
@@ -133,17 +157,19 @@ case "$api_code" in
 esac
 
 # ---- Filesystem directory listing (via pixeldrain-put list) ----
-# Populates LIST_DIRS / LIST_FILES; sets LIST_ERR to an HTTP code or "network"
-# on failure, empty on success.
+# Populates LIST_DIRS / LIST_FILES (names) and LIST_FSIZE (name -> byte size);
+# sets LIST_ERR to an HTTP code or "network" on failure, empty on success.
 typeset -ga LIST_DIRS LIST_FILES
+typeset -gA LIST_FSIZE
 LIST_ERR=""
 pd_list() {
-  LIST_DIRS=(); LIST_FILES=(); LIST_ERR=""
-  local line
+  LIST_DIRS=(); LIST_FILES=(); LIST_FSIZE=(); LIST_ERR=""
+  local line rest fsz fname
   while IFS= read -r line; do
     case "$line" in
       DIR\ *)       LIST_DIRS+=("${line#DIR }") ;;
-      FILE\ *)      LIST_FILES+=("${line#FILE }") ;;
+      FILE\ *)      rest="${line#FILE }"; fsz="${rest%% *}"; fname="${rest#* }"
+                    LIST_FILES+=("$fname"); LIST_FSIZE[$fname]="$fsz" ;;
       HTTPERROR\ *) LIST_ERR="${line#HTTPERROR }" ;;
     esac
   done < <("$PUT_BIN" list "$1")
@@ -160,16 +186,6 @@ prompt_new_folder() {
   name="${name#"${name%%[![:space:]]*}"}"      # strip leading whitespace
   name="${name%"${name##*[![:space:]]}"}"      # strip trailing whitespace
   print -r -- "$name"
-}
-
-# Ask what to do about a name that already exists. Prints Overwrite / Skip / Cancel.
-prompt_dup() {
-  /usr/bin/osascript \
-    -e 'on run argv' \
-    -e 'tell application "System Events" to activate' \
-    -e 'set r to display dialog "\"" & (item 1 of argv) & "\" already exists in this folder." with title "PixelDrain" buttons {"Cancel", "Skip", "Overwrite"} default button "Overwrite"' \
-    -e 'button returned of r' \
-    -e 'end run' -- "$1" 2>/dev/null || print -r -- "Cancel"
 }
 
 UPLOAD_HERE="Upload to This Folder"
@@ -230,7 +246,7 @@ Double-click a folder to open it." "${entries[@]}")" \
     || die "Unable to display the destination picker. AppleScript reported an error."
 
   case "$choice" in
-    CANCELLED)      ui_quit; exit 0 ;;
+    CANCELLED)      ui_quit; /bin/rm -rf "$ctldir"; exit 0 ;;
     "")             die "The destination picker returned no selection." ;;
     "$UPLOAD_HERE") dest="$current"; break ;;
     "$NEW_FOLDER")
@@ -244,83 +260,104 @@ Double-click a folder to open it." "${entries[@]}")" \
 done
 
 if [[ "$dest" == "me" ]]; then dest_label="/"; else dest_label="/${dest#me/}"; fi
-ui "TITLE Uploading $total_items $noun to ${dest_label}"
 
-# Snapshot the destination's existing names for duplicate detection. A brand-new
-# folder won't exist yet (404) — that just means no duplicates.
-ui "STATUS Checking destination…"
+# ---- Copy or Move? ----
+mode="$(/usr/bin/osascript \
+  -e 'on run argv' \
+  -e 'tell application "System Events" to activate' \
+  -e 'set dlg to "Upload into " & (item 1 of argv) & "?" & return & return & "Copy keeps the originals. Move deletes each local file after it uploads. In both modes, files already in the destination with the same name and size are skipped (Move leaves those on disk)."' \
+  -e 'set r to display dialog dlg with title "PixelDrain" buttons {"Cancel", "Move", "Copy"} default button "Copy"' \
+  -e 'button returned of r' \
+  -e 'end run' -- "$dest_label" 2>/dev/null)" || { ui_quit; /bin/rm -rf "$ctldir"; exit 0; }
+case "$mode" in
+  Copy) mode=copy ;;
+  Move) mode=move ;;
+  *)    ui_quit; /bin/rm -rf "$ctldir"; exit 0 ;;
+esac
+
+[[ "$mode" == move ]] && mode_title="Moving" || mode_title="Copying"
+ui "TITLE $mode_title to ${dest_label}"
+
+# ---- build the upload plan (one entry per file) ----
+ui "STATUS Scanning files…"
 ui "PROGRESS ind"
-typeset -A dest_names
-pd_list "$dest"
-if [[ -z "$LIST_ERR" ]]; then
-  for name in "${LIST_DIRS[@]}" "${LIST_FILES[@]}"; do
-    [[ -n "$name" ]] && dest_names[$name]=1
-  done
-fi
-
-# ---- upload each item into the chosen directory ----
-typeset -a done_names failed skipped
-cancelled=0
-n=0
-
+typeset -a up_local up_remote up_size up_display plan_failed
+typeset -i total_files=0 grand_bytes=0 any_folder=0
 for item in "$@"; do
-  (( n++ ))
-
-  # Determine the remote name up front so we can check for duplicates before
-  # spending time compressing a folder.
+  item="${item%/}"                       # tolerate a trailing slash on folders
   if [[ -d "$item" ]]; then
-    target_name="${item:t}.zip"
+    any_folder=1
+    base="${item:t}"
+    for f in "$item"/**/*(.DN); do
+      rel="${f#$item/}"
+      sz=$(/usr/bin/stat -f%z "$f" 2>/dev/null) || sz=0
+      up_local+=("$f"); up_remote+=("$dest/$base/$rel"); up_display+=("$base/$rel"); up_size+=("$sz")
+      (( grand_bytes += sz )); (( total_files++ ))
+    done
   elif [[ -f "$item" ]]; then
-    target_name="${item:t}"
+    sz=$(/usr/bin/stat -f%z "$item" 2>/dev/null) || sz=0
+    up_local+=("$item"); up_remote+=("$dest/${item:t}"); up_display+=("${item:t}"); up_size+=("$sz")
+    (( grand_bytes += sz )); (( total_files++ ))
   else
-    failed+=("${item:t}: file not found")
+    plan_failed+=("${item:t}: not found")
+  fi
+done
+
+# ---- one listing per distinct destination folder -> remote_size map ----
+# Local lookup replaces a per-file network stat: a file already present with the
+# same size is skipped (no request), only files that need uploading hit network.
+typeset -A remote_size seen_dirs
+typeset -a dirs_to_list
+for rp in "${up_remote[@]}"; do
+  pdir="${rp:h}"
+  [[ -z "${seen_dirs[$pdir]-}" ]] && { seen_dirs[$pdir]=1; dirs_to_list+=("$pdir") }
+done
+ui "STATUS Checking destination…"
+for d in "${dirs_to_list[@]}"; do
+  pd_list "$d"
+  [[ -n "$LIST_ERR" ]] && continue   # 404/absent → nothing here to skip against
+  for fname in "${LIST_FILES[@]}"; do
+    remote_size[$d/$fname]="${LIST_FSIZE[$fname]}"
+  done
+done
+
+# ---- upload loop (sequential; one file at a time) ----
+typeset -a done_names failed skipped
+(( ${#plan_failed} )) && failed+=("${plan_failed[@]}")
+typeset -i bytes_done=0 moved_count=0
+fifo="$ctldir/put.out"
+
+for (( i = 1; i <= total_files; i++ )); do
+  upfile="${up_local[i]}"
+  remote="${up_remote[i]}"
+  dsp="${up_display[i]}"
+  fsize="${up_size[i]}"
+
+  pause_gate
+
+  base_pct=0
+  (( grand_bytes > 0 )) && base_pct=$(( bytes_done * 100 / grand_bytes ))
+
+  existing="${remote_size[$remote]-}"
+  # Already present with the same size → skip (Move leaves it on disk).
+  if [[ -n "$existing" && "$existing" == "$fsize" ]]; then
+    skipped+=("$dsp")
+    (( bytes_done += fsize ))
     continue
   fi
-
-  # Whether this name already exists (remotely, or from an earlier item this
-  # batch). Overwrites must NOT be deleted on cancel — only genuinely new files.
+  # Pre-existing (different size) means overwrite: never delete it on cancel.
   target_exists=0
-  [[ -n "${dest_names[$target_name]-}" ]] && target_exists=1
-
-  if (( target_exists )); then
-    case "$(prompt_dup "$target_name")" in
-      Overwrite) ;;
-      Skip)      skipped+=("${item:t}"); continue ;;
-      *)         cancelled=1; break ;;
-    esac
-  fi
-
-  upfile="$item"
-  if [[ -d "$item" ]]; then
-    ui "STATUS Compressing \"${item:t}\" ($n of $total_items)…"
-    ui "PROGRESS $(( (n - 1) * 100 / total_items ))"
-    [[ -z "$tmpdir" ]] && tmpdir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain.XXXXXX")"
-    upfile="$tmpdir/${item:t}.zip"
-    # Backgrounded so Cancel can kill it mid-compression.
-    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$item" "$upfile" &
-    child_pid=$!
-    wait "$child_pid"; ditto_rc=$?
-    child_pid=""
-    if (( ditto_rc != 0 )); then
-      failed+=("${item:t}: compression failed")
-      continue
-    fi
-  fi
-
-  # A FIFO lets us background pixeldrain-put (so Cancel can kill it) while still
-  # reading its PROGRESS/RESULT lines in this shell (setting `result` here).
-  [[ -z "$ctldir" ]] && ctldir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain-ctl.XXXXXX")"
-  fifo="$ctldir/put.out"
+  [[ -n "$existing" ]] && target_exists=1
 
   attempt=1
+  result=""
   while true; do
-    ui "STATUS Uploading \"${upfile:t}\" to ${dest_label} ($n of $total_items)…"
-    ui "PROGRESS $(( (n - 1) * 100 / total_items ))"
+    ui "STATUS Uploading \"$dsp\" ($i of $total_files)…"
+    (( grand_bytes > 0 )) && ui "PROGRESS $base_pct"
 
     /bin/rm -f "$fifo"; /usr/bin/mkfifo "$fifo"
-    # Only mark for partial-delete when the file is new; never delete an overwrite.
-    (( target_exists )) && cur_remote="" || cur_remote="$dest/${upfile:t}"
-    "$PUT_BIN" fs "$upfile" "$dest/${upfile:t}" 2>/dev/null > "$fifo" &
+    (( target_exists )) && cur_remote="" || cur_remote="$remote"
+    "$PUT_BIN" fs "$upfile" "$remote" 2>/dev/null > "$fifo" &
     child_pid=$!
 
     result=""
@@ -328,9 +365,9 @@ for item in "$@"; do
       case "$line" in
         PROGRESS\ *)
           pct="${line#PROGRESS }"
-          # Reweight per-file percent into whole-selection progress.
-          ui "PROGRESS $(( ((n - 1) * 100 + pct) / total_items ))"
-          ui "STATUS Uploading \"${upfile:t}\" ($n of $total_items): ${pct}%"
+          # Byte-weighted overall progress across the whole selection.
+          (( grand_bytes > 0 )) && ui "PROGRESS $(( (100 * bytes_done + fsize * pct) / grand_bytes ))"
+          ui "STATUS Uploading \"$dsp\" ($i of $total_files): ${pct}%"
           ;;
         RESULT\ *) result="${line#RESULT }" ;;
       esac
@@ -344,47 +381,68 @@ for item in "$@"; do
     [[ "$code" == 2* || "$code" == 4* ]] && break
     (( attempt >= 3 )) && break
     (( attempt++ ))
-    ui "STATUS Server error. Retrying \"${upfile:t}\" ($attempt of 3)…"
+    ui "STATUS Server error. Retrying \"$dsp\" ($attempt of 3)…"
     ui "PROGRESS ind"
     /bin/sleep 3
   done
 
   body="${result#* }"
-
   if [[ "$code" == 2* ]]; then
-    done_names+=("${upfile:t}")
-    dest_names[$target_name]=1   # a later identical item in this batch prompts too
+    done_names+=("$dsp")
+    remote_size[$remote]="$fsize"     # now present → a later identical file skips
+    if [[ "$mode" == move ]]; then
+      /bin/rm -f "$upfile" && (( moved_count++ ))
+    fi
   else
     msg="$(print -r -- "$body" | /usr/bin/sed -n 's/.*"message" *: *"\([^"]*\)".*/\1/p')"
     [[ -z "$msg" && "$code" == 0 ]] && msg="$body"
-    failed+=("${item:t}: ${msg:-HTTP error $code}")
+    failed+=("$dsp: ${msg:-HTTP error $code}")
   fi
+
+  (( bytes_done += fsize ))
 done
 
-[[ -n "$tmpdir" ]] && /bin/rm -rf "$tmpdir"
-[[ -n "$ctldir" ]] && /bin/rm -rf "$ctldir"
+# Move: remove directories left empty (skipped files keep their dirs on disk).
+if [[ "$mode" == move ]]; then
+  for item in "$@"; do
+    [[ -d "$item" ]] && /usr/bin/find "$item" -depth -type d -empty -delete 2>/dev/null
+  done
+fi
 
-if (( ${#done_names} > 0 )); then
+/bin/rm -rf "$ctldir"
+
+typeset -i uploaded=${#done_names} nskip=${#skipped} nfail=${#failed}
+
+if (( uploaded > 0 || nskip > 0 )); then
   print -r -- "https://pixeldrain.com/d/$dest" | /usr/bin/pbcopy
 fi
 
-if (( ${#failed} > 0 )); then
-  if (( ${#done_names} > 0 )); then
-    die "Upload failed for ${#failed} of $total_items items. ${failed[1]}"
-  fi
+# Big (folder / many files / >50 MB) → hold the result window open until the user
+# clicks Close. A quick single small file still auto-closes.
+big=0
+(( any_folder || total_files > 1 || grand_bytes > 50 * 1024 * 1024 )) && big=1
+finish() { if (( big )); then ui_done_hold "$1"; else ui_done "$1"; fi }
+
+# Nothing uploaded at all, but there were hard failures → error alert.
+if (( uploaded == 0 && nfail > 0 )); then
   die "Upload failed. ${failed[1]}"
 fi
 
-# Nothing uploaded and nothing failed → everything was skipped or cancelled.
-if (( ${#done_names} == 0 )); then
-  ui_done "No files were uploaded."
+# Nothing uploaded and nothing failed → everything was already up to date / empty.
+if (( uploaded == 0 )); then
+  if (( nskip > 0 )); then
+    finish "Nothing to upload — $nskip file(s) already up to date in ${dest_label}."
+  else
+    finish "No files were uploaded."
+  fi
   exit 0
 fi
 
-dnoun="items"; (( ${#done_names} == 1 )) && dnoun="item"
-summary="Upload complete. ${#done_names} $dnoun uploaded to ${dest_label}."
-(( ${#skipped} > 0 )) && summary+=" ${#skipped} skipped."
-(( cancelled )) && summary+=" Cancelled before finishing."
+dnoun="files"; (( uploaded == 1 )) && dnoun="file"
+summary="Upload complete. $uploaded $dnoun uploaded to ${dest_label}."
+(( nskip > 0 ))  && summary+=" $nskip already up to date."
+[[ "$mode" == move ]] && summary+=" $moved_count removed from disk."
+(( nfail > 0 ))  && summary+=" $nfail failed (${failed[1]})."
 summary+=" Folder link copied to clipboard."
-ui_done "$summary"
-notify "Upload complete. ${#done_names} $dnoun uploaded to ${dest_label}."
+finish "$summary"
+notify "Uploaded $uploaded $dnoun to ${dest_label}."
