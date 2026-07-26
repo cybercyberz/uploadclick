@@ -10,3 +10,6 @@ __pycache__/
 
 # PyCharm scaffolding, unrelated to this project
 sample.ipynb
+
+# graphify knowledge-graph output
+graphify-out/
