@@ -1,4 +1,4 @@
-# Upload to PixelDrain Folder…
+# Upload to PixelDrain Folder
 
 A macOS Finder **Quick Action** that uploads any selected files or folders into
 a directory of your choice in the [PixelDrain Filesystem](https://pixeldrain.com/d/me).
