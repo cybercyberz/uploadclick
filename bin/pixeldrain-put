@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""PixelDrain helper: streaming uploader + Filesystem directory listing.
+
+The API key is read from the PD_AUTH_KEY environment variable (never passed on
+the command line, so it can't leak through `ps`). Cookie auth is used because
+PixelDrain's Basic-auth handling returned HTTP 500 for every key during the
+2026-07 outage while cookie auth kept working.
+
+Usage:
+  pixeldrain-put fs   <local_file> <remote_path>   # PUT to /api/filesystem/<path>?make_parents=true
+  pixeldrain-put file <local_file> <remote_name>   # PUT to /api/file/<name>
+  pixeldrain-put list <path>                        # list one Filesystem directory
+
+Upload modes print, one per line:
+  PROGRESS <0-100>            upload progress
+  RESULT <status> <body>     final HTTP status + response body
+  RESULT 0 <error message>   network-level failure
+
+list prints, one per line:
+  DIR  <name>                a subdirectory
+  FILE <name>                a file
+  HTTPERROR <code|network>   on failure (code is the HTTP status)
+"""
+import http.client
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CHUNK = 1024 * 1024
+HOST = "pixeldrain.com"
+
+
+def emit(line):
+    print(line, flush=True)
+
+
+def get_key():
+    key = os.environ.get("PD_AUTH_KEY", "").strip()
+    if not key:
+        emit("RESULT 0 PD_AUTH_KEY not set")
+        sys.exit(1)
+    return key
+
+
+def encode_path(path):
+    return "/".join(urllib.parse.quote(s) for s in path.split("/"))
+
+
+def do_list(path):
+    key = os.environ.get("PD_AUTH_KEY", "").strip()
+    if not key:
+        emit("HTTPERROR network")
+        return
+    req = urllib.request.Request(
+        f"https://{HOST}/api/filesystem/{encode_path(path)}?stat",
+        headers={"Cookie": "pd_auth_key=" + key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        emit(f"HTTPERROR {e.code}")
+        return
+    except Exception:
+        emit("HTTPERROR network")
+        return
+
+    children = data.get("children") or []
+    dirs = sorted(
+        (c["name"] for c in children if c.get("type") == "dir" and c.get("name")),
+        key=str.lower,
+    )
+    files = sorted(
+        (c["name"] for c in children if c.get("type") != "dir" and c.get("name")),
+        key=str.lower,
+    )
+    for n in dirs:
+        emit(f"DIR {n}")
+    for n in files:
+        emit(f"FILE {n}")
+
+
+def do_upload(mode, local_file, remote):
+    get_key()  # validate presence early
+    key = os.environ["PD_AUTH_KEY"].strip()
+    size = os.path.getsize(local_file)
+    cookie = "pd_auth_key=" + key
+
+    # Raw PUT for both modes, as recommended by the PixelDrain API docs.
+    if mode == "fs":
+        req_path = "/api/filesystem/" + encode_path(remote) + "?make_parents=true"
+    else:
+        req_path = "/api/file/" + urllib.parse.quote(remote)
+
+    total = size
+    conn = http.client.HTTPSConnection(HOST, timeout=120)
+    try:
+        conn.putrequest("PUT", req_path)
+        conn.putheader("Cookie", cookie)
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(total))
+        conn.endheaders()
+
+        sent = 0
+        last_pct = -1
+
+        def send(data):
+            nonlocal sent, last_pct
+            conn.send(data)
+            sent += len(data)
+            pct = int(sent * 100 / total) if total else 100
+            if pct != last_pct:
+                emit(f"PROGRESS {pct}")
+                last_pct = pct
+
+        with open(local_file, "rb") as f:
+            while True:
+                block = f.read(CHUNK)
+                if not block:
+                    break
+                send(block)
+
+        resp = conn.getresponse()
+        body = resp.read(65536).decode("utf-8", "replace").replace("\n", " ")
+        emit(f"RESULT {resp.status} {body}")
+    except Exception as e:
+        emit(f"RESULT 0 {type(e).__name__}: {e}")
+    finally:
+        conn.close()
+
+
+def main():
+    if len(sys.argv) < 2:
+        emit("RESULT 0 usage: pixeldrain-put <fs|file|list> ...")
+        sys.exit(1)
+    mode = sys.argv[1]
+    if mode == "list":
+        do_list(sys.argv[2])
+    elif mode in ("fs", "file"):
+        do_upload(mode, sys.argv[2], sys.argv[3])
+    else:
+        emit(f"RESULT 0 unknown mode: {mode}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

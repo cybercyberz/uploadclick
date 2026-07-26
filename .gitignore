@@ -1,0 +1,12 @@
+# Python virtualenv
+.venv/
+__pycache__/
+*.pyc
+
+# IDE / OS cruft
+.idea/
+.claude/
+.DS_Store
+
+# PyCharm scaffolding, unrelated to this project
+sample.ipynb

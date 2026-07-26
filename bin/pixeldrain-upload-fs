@@ -1,0 +1,390 @@
+#!/bin/zsh
+# Upload files/folders into a chosen directory of the PixelDrain Filesystem
+# (pixeldrain.com/d/me, a Pro feature). Finder-style navigation: each dialog
+# shows one directory; double-click a folder to open it, "Go Up One Level" to
+# go back, "New Folder Here…" to create one, "Upload to This Folder" to pick the
+# current one. Local folders are zipped before upload.
+# Shows a floating progress window with live status and overall percentage.
+# API key is read from ~/.pixeldrain_api_key and passed to the helpers via the
+# PD_AUTH_KEY environment variable (never on the command line, so it can't leak
+# through `ps`).
+set -u
+trap '' PIPE
+
+KEY_FILE="$HOME/.pixeldrain_api_key"
+UI_BIN="$HOME/.local/bin/pixeldrain-progress"
+PUT_BIN="$HOME/.local/bin/pixeldrain-put"
+
+notify() {
+  /usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "PixelDrain"' \
+    -e 'end run' -- "$1" >/dev/null 2>&1
+}
+
+# Blocking alert dialog, used as fallback when the progress window is unavailable.
+alert() {
+  /usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'display alert "PixelDrain" message (item 1 of argv) as critical buttons {"OK"} default button "OK"' \
+    -e 'end run' -- "$1" >/dev/null 2>&1
+}
+
+ui_active=0
+ui() { (( ui_active )) && { print -r -- "$1" >&3 2>/dev/null || ui_active=0 } }
+ui_open() {
+  if [[ -x "$UI_BIN" ]]; then
+    # Pass our PID so the window's Cancel button can SIGTERM us back.
+    exec 3> >("$UI_BIN" $$)
+    ui_active=1
+  fi
+}
+ui_done() { ui "DONE $1"; (( ui_active )) && exec 3>&-; ui_active=0 }
+ui_quit() { (( ui_active )) && exec 3>&-; ui_active=0 }
+# Error path: close the progress window, then show a blocking alert.
+# The alert keeps the workflow process alive until dismissed; the window
+# would be killed the moment the script exits.
+die() {
+  if (( ui_active )); then
+    exec 3>&-
+    ui_active=0
+  fi
+  alert "$1"
+  exit 1
+}
+
+if (( $# == 0 )); then
+  print -u2 "Usage: pixeldrain-upload-fs <file-or-folder> [...]"
+  exit 1
+fi
+
+total_items=$#
+noun="items"; (( total_items == 1 )) && noun="item"
+
+ui_open
+ui "TITLE Uploading $total_items $noun to the PixelDrain Filesystem"
+ui "STATUS Reading API key…"
+
+[[ -s "$KEY_FILE" ]] || die "No API key found. Save your key to ~/.pixeldrain_api_key and try again."
+API_KEY="$(/usr/bin/tr -d '[:space:]' < "$KEY_FILE")"
+export PD_AUTH_KEY="$API_KEY"
+
+# ---- cancellation state + handler ----
+# Populated as work proceeds so the Cancel handler can tear everything down.
+child_pid=""    # PID of the current killable child (pixeldrain-put / ditto)
+cur_remote=""   # remote path of the upload in flight (for partial cleanup)
+tmpdir=""       # holds zipped folders
+ctldir=""       # holds the upload FIFO
+
+# DELETE a Filesystem path. Cookie is passed via a stdin curl config (print is a
+# builtin), so the key never lands in argv.
+pd_delete() {
+  local enc
+  enc="$(/usr/bin/python3 -c 'import sys,urllib.parse; print("/".join(urllib.parse.quote(s) for s in sys.argv[1].split("/")))' "$1" 2>/dev/null)" || return
+  print -r -- "header = \"Cookie: pd_auth_key=$API_KEY\"
+request = \"DELETE\"
+url = \"https://pixeldrain.com/api/filesystem/$enc\"" | \
+    /usr/bin/curl -sS -m 15 -o /dev/null -K - 2>/dev/null
+}
+
+# Cancel: kill the in-flight child, delete any partial remote file, clean up.
+cancel_handler() {
+  trap '' TERM INT
+  [[ -n "$child_pid" ]] && kill "$child_pid" 2>/dev/null
+  [[ -n "$cur_remote" ]] && pd_delete "$cur_remote"
+  [[ -n "$tmpdir" ]] && /bin/rm -rf "$tmpdir"
+  [[ -n "$ctldir" ]] && /bin/rm -rf "$ctldir"
+  ui_quit
+  exit 0
+}
+trap cancel_handler TERM INT
+
+# Preflight the Python dependency up front. On a Mac without Command Line Tools,
+# /usr/bin/python3 pops a system install prompt; catching it here avoids that
+# surprise mid-upload.
+ui "STATUS Checking prerequisites…"
+if ! /usr/bin/python3 --version >/dev/null 2>&1; then
+  die "This action needs the macOS Command Line Tools (python3). Open Terminal, run:  xcode-select --install  and try again once it finishes."
+fi
+
+ui "STATUS Contacting pixeldrain.com…"
+# Auth via a curl config read from stdin (print is a shell builtin, so the key
+# never appears in any process's argument list).
+api_check() {
+  print -r -- "header = \"Cookie: pd_auth_key=$API_KEY\"
+url = \"https://pixeldrain.com/api/user\"" | \
+    /usr/bin/curl -sS -m 15 -o /dev/null -w "%{http_code}" -K - 2>/dev/null || print 000
+}
+attempt=1
+while true; do
+  api_code="$(api_check)"
+  [[ "$api_code" == 200 || "$api_code" == 4* ]] && break
+  (( attempt >= 3 )) && break
+  (( attempt++ ))
+  ui "STATUS PixelDrain not responding (HTTP $api_code). Retrying ($attempt of 3)…"
+  /bin/sleep 2
+done
+case "$api_code" in
+  200) ;;
+  401|403) die "API key rejected (HTTP $api_code). Generate a new key at pixeldrain.com/user/api_keys." ;;
+  000)     die "Unable to reach pixeldrain.com. Check your network connection." ;;
+  5*)      die "PixelDrain server error (HTTP $api_code). The service is temporarily unavailable. Try again later." ;;
+  *)       die "Unexpected API response (HTTP $api_code)." ;;
+esac
+
+# ---- Filesystem directory listing (via pixeldrain-put list) ----
+# Populates LIST_DIRS / LIST_FILES; sets LIST_ERR to an HTTP code or "network"
+# on failure, empty on success.
+typeset -ga LIST_DIRS LIST_FILES
+LIST_ERR=""
+pd_list() {
+  LIST_DIRS=(); LIST_FILES=(); LIST_ERR=""
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      DIR\ *)       LIST_DIRS+=("${line#DIR }") ;;
+      FILE\ *)      LIST_FILES+=("${line#FILE }") ;;
+      HTTPERROR\ *) LIST_ERR="${line#HTTPERROR }" ;;
+    esac
+  done < <("$PUT_BIN" list "$1")
+}
+
+# Ask for a new folder name; prints the trimmed name, or empty if cancelled/blank.
+prompt_new_folder() {
+  local name
+  name="$(/usr/bin/osascript \
+    -e 'tell application "System Events" to activate' \
+    -e 'set r to display dialog "New folder name:" default answer "" with title "PixelDrain" buttons {"Cancel", "Create"} default button "Create"' \
+    -e 'text returned of r' 2>/dev/null)" || { print -r -- ""; return }
+  name="${name//\//}"                          # slashes would break the path
+  name="${name#"${name%%[![:space:]]*}"}"      # strip leading whitespace
+  name="${name%"${name##*[![:space:]]}"}"      # strip trailing whitespace
+  print -r -- "$name"
+}
+
+# Ask what to do about a name that already exists. Prints Overwrite / Skip / Cancel.
+prompt_dup() {
+  /usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'tell application "System Events" to activate' \
+    -e 'set r to display dialog "\"" & (item 1 of argv) & "\" already exists in this folder." with title "PixelDrain" buttons {"Cancel", "Skip", "Overwrite"} default button "Overwrite"' \
+    -e 'button returned of r' \
+    -e 'end run' -- "$1" 2>/dev/null || print -r -- "Cancel"
+}
+
+UPLOAD_HERE="Upload to This Folder"
+NEW_FOLDER="＋ New Folder Here…"
+GO_UP="Go Up One Level"
+
+# ---- Finder-style navigation loop ----
+current="me"
+dest=""
+while true; do
+  ui "STATUS Loading folder list…"
+  ui "PROGRESS ind"
+  pd_list "$current"
+  attempt=1
+  # Retry only transient failures (network / 5xx); 4xx won't fix on retry.
+  while [[ -n "$LIST_ERR" ]] && (( attempt < 3 )); do
+    case "$LIST_ERR" in network|5*) ;; *) break ;; esac
+    (( attempt++ ))
+    ui "STATUS Server error while listing folders. Retrying ($attempt of 3)…"
+    /bin/sleep 2
+    pd_list "$current"
+  done
+  if [[ -n "$LIST_ERR" ]]; then
+    case "$LIST_ERR" in
+      401|402|403) die "Access to the PixelDrain Filesystem was denied (HTTP $LIST_ERR). This feature requires an active Pro subscription." ;;
+      404)         die "Folder not found on PixelDrain (HTTP 404)." ;;
+      5*)          die "PixelDrain server error while listing folders (HTTP $LIST_ERR). The service is temporarily unavailable. Try again later." ;;
+      network)     die "Unable to reach pixeldrain.com while listing folders. Check your network connection." ;;
+      *)           die "Unable to list the PixelDrain Filesystem (error: $LIST_ERR)." ;;
+    esac
+  fi
+
+  typeset -a entries
+  entries=("$UPLOAD_HERE" "$NEW_FOLDER")
+  [[ "$current" != "me" ]] && entries+=("$GO_UP")
+  # Subfolders carry a trailing slash so they are distinguishable from the
+  # action rows above and from files.
+  for name in "${LIST_DIRS[@]}"; do
+    [[ -z "$name" ]] && continue
+    entries+=("$name/")
+  done
+
+  if [[ "$current" == "me" ]]; then disp="/"; else disp="/${current#me/}"; fi
+  ui "STATUS Waiting for destination selection (${disp})…"
+
+  # Note: "OK button name" takes no "with" keyword. Adding one is a syntax
+  # error, which makes osascript exit non-zero with no output.
+  choice="$(/usr/bin/osascript \
+    -e 'on run argv' \
+    -e 'set thePrompt to item 1 of argv' \
+    -e 'set L to rest of argv' \
+    -e 'tell application "System Events" to activate' \
+    -e 'set r to choose from list L with title "PixelDrain" with prompt thePrompt default items {item 1 of L} OK button name "Choose" cancel button name "Cancel"' \
+    -e 'if r is false then return "CANCELLED"' \
+    -e 'return item 1 of r' \
+    -e 'end run' -- "Current folder: ${disp}
+Double-click a folder to open it." "${entries[@]}")" \
+    || die "Unable to display the destination picker. AppleScript reported an error."
+
+  case "$choice" in
+    CANCELLED)      ui_quit; exit 0 ;;
+    "")             die "The destination picker returned no selection." ;;
+    "$UPLOAD_HERE") dest="$current"; break ;;
+    "$NEW_FOLDER")
+      newname="$(prompt_new_folder)"
+      [[ -z "$newname" ]] && continue   # cancelled or blank → back to the list
+      dest="$current/$newname"; break ;;
+    "$GO_UP")       current="${current:h}" ;;
+    */)             current="$current/${choice%/}" ;;
+    *)              die "Unrecognised selection: $choice" ;;
+  esac
+done
+
+if [[ "$dest" == "me" ]]; then dest_label="/"; else dest_label="/${dest#me/}"; fi
+ui "TITLE Uploading $total_items $noun to ${dest_label}"
+
+# Snapshot the destination's existing names for duplicate detection. A brand-new
+# folder won't exist yet (404) — that just means no duplicates.
+ui "STATUS Checking destination…"
+ui "PROGRESS ind"
+typeset -A dest_names
+pd_list "$dest"
+if [[ -z "$LIST_ERR" ]]; then
+  for name in "${LIST_DIRS[@]}" "${LIST_FILES[@]}"; do
+    [[ -n "$name" ]] && dest_names[$name]=1
+  done
+fi
+
+# ---- upload each item into the chosen directory ----
+typeset -a done_names failed skipped
+cancelled=0
+n=0
+
+for item in "$@"; do
+  (( n++ ))
+
+  # Determine the remote name up front so we can check for duplicates before
+  # spending time compressing a folder.
+  if [[ -d "$item" ]]; then
+    target_name="${item:t}.zip"
+  elif [[ -f "$item" ]]; then
+    target_name="${item:t}"
+  else
+    failed+=("${item:t}: file not found")
+    continue
+  fi
+
+  # Whether this name already exists (remotely, or from an earlier item this
+  # batch). Overwrites must NOT be deleted on cancel — only genuinely new files.
+  target_exists=0
+  [[ -n "${dest_names[$target_name]-}" ]] && target_exists=1
+
+  if (( target_exists )); then
+    case "$(prompt_dup "$target_name")" in
+      Overwrite) ;;
+      Skip)      skipped+=("${item:t}"); continue ;;
+      *)         cancelled=1; break ;;
+    esac
+  fi
+
+  upfile="$item"
+  if [[ -d "$item" ]]; then
+    ui "STATUS Compressing \"${item:t}\" ($n of $total_items)…"
+    ui "PROGRESS $(( (n - 1) * 100 / total_items ))"
+    [[ -z "$tmpdir" ]] && tmpdir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain.XXXXXX")"
+    upfile="$tmpdir/${item:t}.zip"
+    # Backgrounded so Cancel can kill it mid-compression.
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$item" "$upfile" &
+    child_pid=$!
+    wait "$child_pid"; ditto_rc=$?
+    child_pid=""
+    if (( ditto_rc != 0 )); then
+      failed+=("${item:t}: compression failed")
+      continue
+    fi
+  fi
+
+  # A FIFO lets us background pixeldrain-put (so Cancel can kill it) while still
+  # reading its PROGRESS/RESULT lines in this shell (setting `result` here).
+  [[ -z "$ctldir" ]] && ctldir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain-ctl.XXXXXX")"
+  fifo="$ctldir/put.out"
+
+  attempt=1
+  while true; do
+    ui "STATUS Uploading \"${upfile:t}\" to ${dest_label} ($n of $total_items)…"
+    ui "PROGRESS $(( (n - 1) * 100 / total_items ))"
+
+    /bin/rm -f "$fifo"; /usr/bin/mkfifo "$fifo"
+    # Only mark for partial-delete when the file is new; never delete an overwrite.
+    (( target_exists )) && cur_remote="" || cur_remote="$dest/${upfile:t}"
+    "$PUT_BIN" fs "$upfile" "$dest/${upfile:t}" 2>/dev/null > "$fifo" &
+    child_pid=$!
+
+    result=""
+    while IFS= read -r line; do
+      case "$line" in
+        PROGRESS\ *)
+          pct="${line#PROGRESS }"
+          # Reweight per-file percent into whole-selection progress.
+          ui "PROGRESS $(( ((n - 1) * 100 + pct) / total_items ))"
+          ui "STATUS Uploading \"${upfile:t}\" ($n of $total_items): ${pct}%"
+          ;;
+        RESULT\ *) result="${line#RESULT }" ;;
+      esac
+    done < "$fifo"
+
+    wait "$child_pid"
+    child_pid=""
+    cur_remote=""
+
+    code="${result%% *}"
+    [[ "$code" == 2* || "$code" == 4* ]] && break
+    (( attempt >= 3 )) && break
+    (( attempt++ ))
+    ui "STATUS Server error. Retrying \"${upfile:t}\" ($attempt of 3)…"
+    ui "PROGRESS ind"
+    /bin/sleep 3
+  done
+
+  body="${result#* }"
+
+  if [[ "$code" == 2* ]]; then
+    done_names+=("${upfile:t}")
+    dest_names[$target_name]=1   # a later identical item in this batch prompts too
+  else
+    msg="$(print -r -- "$body" | /usr/bin/sed -n 's/.*"message" *: *"\([^"]*\)".*/\1/p')"
+    [[ -z "$msg" && "$code" == 0 ]] && msg="$body"
+    failed+=("${item:t}: ${msg:-HTTP error $code}")
+  fi
+done
+
+[[ -n "$tmpdir" ]] && /bin/rm -rf "$tmpdir"
+[[ -n "$ctldir" ]] && /bin/rm -rf "$ctldir"
+
+if (( ${#done_names} > 0 )); then
+  print -r -- "https://pixeldrain.com/d/$dest" | /usr/bin/pbcopy
+fi
+
+if (( ${#failed} > 0 )); then
+  if (( ${#done_names} > 0 )); then
+    die "Upload failed for ${#failed} of $total_items items. ${failed[1]}"
+  fi
+  die "Upload failed. ${failed[1]}"
+fi
+
+# Nothing uploaded and nothing failed → everything was skipped or cancelled.
+if (( ${#done_names} == 0 )); then
+  ui_done "No files were uploaded."
+  exit 0
+fi
+
+dnoun="items"; (( ${#done_names} == 1 )) && dnoun="item"
+summary="Upload complete. ${#done_names} $dnoun uploaded to ${dest_label}."
+(( ${#skipped} > 0 )) && summary+=" ${#skipped} skipped."
+(( cancelled )) && summary+=" Cancelled before finishing."
+summary+=" Folder link copied to clipboard."
+ui_done "$summary"
+notify "Upload complete. ${#done_names} $dnoun uploaded to ${dest_label}."
