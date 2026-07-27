@@ -9,22 +9,30 @@
 # Folders are uploaded file-by-file, recreating the folder tree on PixelDrain
 # (make_parents), so the progress window can show each file as it goes up and
 # per-file skip/move can work. After picking a destination you choose Copy or
-# Move; Move deletes each local file once it uploads. In both modes a file that
-# already exists in the destination with the same name and size is skipped (in
-# Move it is left on disk).
+# Move; Move permanently deletes each local file once it uploads — it does not
+# move them to the Trash, so there is no undo. In both modes a file that already
+# exists in the destination with the same name and size is skipped (in Move it is
+# left on disk).
 #
 # Shows a floating progress window with live status, per-file names, overall
 # byte-weighted percentage, a Pause/Resume button, and a Cancel button.
 # API key is read from ~/.pixeldrain_api_key and passed to the helpers via the
-# PD_AUTH_KEY environment variable (never on the command line, so it can't leak
-# through `ps`).
+# PD_AUTH_KEY environment variable, set per-invocation on just the commands that
+# need it (never on a command line, so it can't leak through `ps`, and never in
+# the environment of unrelated children like osascript or find).
+#
+# Every file's outcome is appended to ~/Library/Logs/pixeldrain-upload.log; the
+# progress window can only show a summary, so the log is where per-file errors
+# and helper stderr actually live.
 set -u
 trap '' PIPE
 
 KEY_FILE="$HOME/.pixeldrain_api_key"
-UI_BIN="$HOME/.local/bin/pixeldrain-progress"
-PICK_BIN="$HOME/.local/bin/pixeldrain-picker"
-PUT_BIN="$HOME/.local/bin/pixeldrain-put"
+# Helper locations. Overridable so the test suite can point them at stubs.
+: ${UI_BIN:="$HOME/.local/bin/pixeldrain-progress"}
+: ${PICK_BIN:="$HOME/.local/bin/pixeldrain-picker"}
+: ${PUT_BIN:="$HOME/.local/bin/pixeldrain-put"}
+: ${LOG_FILE:="$HOME/Library/Logs/pixeldrain-upload.log"}
 
 notify() {
   /usr/bin/osascript \
@@ -41,15 +49,58 @@ alert() {
     -e 'end run' -- "$1" >/dev/null 2>&1
 }
 
+# ---- run log ----
+# The progress window can only show a summary, so per-file outcomes and helper
+# stderr go here. Best-effort: a failure to log must never break an upload.
+log() {
+  print -r -- "$(/bin/date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE" 2>/dev/null
+}
+
+# Percent-encode each segment of a path, leaving the separators intact. Used for
+# both the DELETE endpoint and the folder link put on the clipboard.
+pd_encode_path() {
+  /usr/bin/python3 -c \
+    'import sys,urllib.parse; print("/".join(urllib.parse.quote(s) for s in sys.argv[1].split("/")))' \
+    "$1" 2>/dev/null
+}
+
+# ---- retry policy (shared by the listing and upload paths) ----
+RETRY_ATTEMPTS=3
+RETRY_DELAY=2
+UPLOAD_RETRY_DELAY=3
+
+# A failure is worth retrying only if it might resolve itself: a network hiccup
+# or a 5xx. Everything else — 4xx, "nokey", the helper's own permanent -1, or an
+# empty result (helper missing/not executable) — will fail the same way forever.
+is_transient() {
+  case "$1" in
+    network|5*) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
+# The same question for the upload path, whose codes come from pixeldrain-put's
+# RESULT line: 0 is a socket/network error, -1 is a permanent failure the helper
+# diagnosed itself (missing file, no key), and an empty code means no RESULT
+# arrived at all — the helper is missing, not executable, or was killed.
+is_transient_upload() {
+  case "$1" in
+    0|5*) return 0 ;;
+    *)    return 1 ;;
+  esac
+}
+
 ui_active=0
 ui() { (( ui_active )) && { print -r -- "$1" >&3 2>/dev/null || ui_active=0 } }
 ui_open() {
-  if [[ -x "$UI_BIN" ]]; then
-    # Pass our PID (Cancel → SIGTERM us) and the pause-control file the
-    # window's Pause button toggles.
-    exec 3> >("$UI_BIN" $$ "$pausefile")
-    ui_active=1
-  fi
+  # The progress window is the only route to Pause and Cancel, so a missing
+  # binary is fatal — silently degrading would leave an unstoppable upload
+  # running with no feedback. Matches how a missing picker is handled.
+  [[ -x "$UI_BIN" ]] || die "The progress window component is missing. Re-run install.sh."
+  # Pass our PID (Cancel → SIGTERM us) and the pause-control file the
+  # window's Pause button toggles.
+  exec 3> >("$UI_BIN" $$ "$pausefile")
+  ui_active=1
 }
 ui_done()      { ui "DONE $1";     (( ui_active )) && exec 3>&-; ui_active=0 }
 ui_done_hold() { ui "DONEHOLD $1"; (( ui_active )) && exec 3>&-; ui_active=0 }
@@ -66,6 +117,12 @@ picker_open() {
   fi
 }
 pk() { (( picker_active )) && print -rp -- "$1" 2>/dev/null }
+
+# Route a status line to whichever window is currently up: the picker owns the
+# setup phase, the progress window owns the upload phase.
+status() {
+  if (( picker_active )); then pk "STATUS $1"; else ui "STATUS $1"; fi
+}
 
 # Block while the UI has raised the pause flag. Checked at each file boundary.
 pause_gate() {
@@ -97,18 +154,56 @@ die() {
   exit 1
 }
 
+# ---- Filesystem directory listing (via pixeldrain-put list) ----
+# Populates LIST_DIRS / LIST_FILES (names) and LIST_FSIZE (name -> byte size);
+# sets LIST_ERR to an HTTP code, "network", or "nokey" on failure, empty on
+# success.
+typeset -ga LIST_DIRS LIST_FILES
+typeset -gA LIST_FSIZE
+LIST_ERR=""
+pd_list() {
+  LIST_DIRS=(); LIST_FILES=(); LIST_FSIZE=(); LIST_ERR=""
+  local line rest fsz fname
+  while IFS= read -r line; do
+    case "$line" in
+      DIR\ *)       LIST_DIRS+=("${line#DIR }") ;;
+      FILE\ *)      rest="${line#FILE }"; fsz="${rest%% *}"; fname="${rest#* }"
+                    LIST_FILES+=("$fname"); LIST_FSIZE[$fname]="$fsz" ;;
+      HTTPERROR\ *) LIST_ERR="${line#HTTPERROR }" ;;
+    esac
+  done < <(PD_AUTH_KEY="${API_KEY-}" "$PUT_BIN" list "$1" 2>>"$LOG_FILE")
+}
+
+# pd_list plus the shared transient-failure retry. Both callers — the picker's
+# navigation and the pre-upload destination scan — need identical behavior, so
+# neither should be re-implementing the loop. $2 labels the retry status line.
+pd_list_retry() {
+  local lpath="$1" doing="${2-}"
+  local -i attempt=1
+  pd_list "$lpath"
+  while [[ -n "$LIST_ERR" ]] && is_transient "$LIST_ERR" && (( attempt < RETRY_ATTEMPTS )); do
+    (( attempt++ ))
+    [[ -n "$doing" ]] && status "Server error while $doing. Retrying ($attempt of $RETRY_ATTEMPTS)…"
+    /bin/sleep "$RETRY_DELAY"
+    pd_list "$lpath"
+  done
+}
+
+# Test hook: sourcing with PD_LIB_ONLY=1 loads the helpers above without running
+# an upload, so tests/run.sh can exercise them against stub helpers.
+[[ "${PD_LIB_ONLY:-0}" == 1 ]] && return 0
+
 if (( $# == 0 )); then
   print -u2 "Usage: pixeldrain-upload-fs <file-or-folder> [...]"
   exit 1
 fi
 
-total_items=$#
-noun="items"; (( total_items == 1 )) && noun="item"
-
 # ---- control dir: upload FIFO + the pause flag the UI toggles ----
 ctldir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/pixeldrain-ctl.XXXXXX")"
 pausefile="$ctldir/pause"
 print -rn -- 0 > "$pausefile"
+
+/bin/mkdir -p "${LOG_FILE:h}" 2>/dev/null
 
 # Open the destination picker first; it shows a spinner + these status lines
 # while we preflight, then swaps to the folder browser once listings arrive.
@@ -117,7 +212,21 @@ pk "STATUS Reading API key…"
 
 [[ -s "$KEY_FILE" ]] || die "No API key found. Save your key to ~/.pixeldrain_api_key and try again."
 API_KEY="$(/usr/bin/tr -d '[:space:]' < "$KEY_FILE")"
-export PD_AUTH_KEY="$API_KEY"
+# -s only proves the file is non-empty; a file holding just a newline strips to
+# nothing and would otherwise fail later as a confusing "key rejected".
+[[ -n "$API_KEY" ]] || die "No API key found. Save your key to ~/.pixeldrain_api_key and try again."
+# The key gets interpolated into curl config text below, where a stray quote or
+# backslash would silently corrupt the request rather than fail loudly. Keys are
+# URL-safe, so anything else means the file holds something that isn't a key.
+if [[ -n "${API_KEY//[A-Za-z0-9._~-]/}" ]]; then
+  die "The API key in ~/.pixeldrain_api_key contains unexpected characters. Re-copy it from pixeldrain.com/user/api_keys."
+fi
+# A key other accounts on this Mac can read is worth flagging, but not fatal.
+key_mode="$(/usr/bin/stat -f%Lp "$KEY_FILE" 2>/dev/null)"
+if [[ -n "$key_mode" && "${key_mode[-2,-1]}" != 00 ]]; then
+  log "WARN $KEY_FILE has mode $key_mode (group/world-readable)"
+  pk "STATUS Warning: ~/.pixeldrain_api_key is readable by other users — chmod 600 it."
+fi
 
 # ---- cancellation state + handler ----
 # Populated as work proceeds so the Cancel handler can tear everything down.
@@ -128,7 +237,8 @@ cur_remote=""   # remote path of the upload in flight (for partial cleanup)
 # builtin), so the key never lands in argv.
 pd_delete() {
   local enc
-  enc="$(/usr/bin/python3 -c 'import sys,urllib.parse; print("/".join(urllib.parse.quote(s) for s in sys.argv[1].split("/")))' "$1" 2>/dev/null)" || return
+  enc="$(pd_encode_path "$1")" || return
+  [[ -n "$enc" ]] || return
   print -r -- "header = \"Cookie: pd_auth_key=$API_KEY\"
 request = \"DELETE\"
 url = \"https://pixeldrain.com/api/filesystem/$enc\"" | \
@@ -166,10 +276,10 @@ attempt=1
 while true; do
   api_code="$(api_check)"
   [[ "$api_code" == 200 || "$api_code" == 4* ]] && break
-  (( attempt >= 3 )) && break
+  (( attempt >= RETRY_ATTEMPTS )) && break
   (( attempt++ ))
-  pk "STATUS PixelDrain not responding (HTTP $api_code). Retrying ($attempt of 3)…"
-  /bin/sleep 2
+  pk "STATUS PixelDrain not responding (HTTP $api_code). Retrying ($attempt of $RETRY_ATTEMPTS)…"
+  /bin/sleep "$RETRY_DELAY"
 done
 case "$api_code" in
   200) ;;
@@ -178,25 +288,6 @@ case "$api_code" in
   5*)      die "PixelDrain server error (HTTP $api_code). The service is temporarily unavailable. Try again later." ;;
   *)       die "Unexpected API response (HTTP $api_code)." ;;
 esac
-
-# ---- Filesystem directory listing (via pixeldrain-put list) ----
-# Populates LIST_DIRS / LIST_FILES (names) and LIST_FSIZE (name -> byte size);
-# sets LIST_ERR to an HTTP code or "network" on failure, empty on success.
-typeset -ga LIST_DIRS LIST_FILES
-typeset -gA LIST_FSIZE
-LIST_ERR=""
-pd_list() {
-  LIST_DIRS=(); LIST_FILES=(); LIST_FSIZE=(); LIST_ERR=""
-  local line rest fsz fname
-  while IFS= read -r line; do
-    case "$line" in
-      DIR\ *)       LIST_DIRS+=("${line#DIR }") ;;
-      FILE\ *)      rest="${line#FILE }"; fsz="${rest%% *}"; fname="${rest#* }"
-                    LIST_FILES+=("$fname"); LIST_FSIZE[$fname]="$fsz" ;;
-      HTTPERROR\ *) LIST_ERR="${line#HTTPERROR }" ;;
-    esac
-  done < <("$PUT_BIN" list "$1")
-}
 
 # ---- navigation, driven by the native picker window ----
 # The picker requests a folder's contents (LIST <path>); we stream them back as
@@ -217,22 +308,15 @@ while (( picker_active )); do
   case "$verb" in
     LIST)
       lpath="${cmdline#LIST }"
-      pd_list "$lpath"
-      attempt=1
-      # Retry only transient failures (network / 5xx); 4xx won't fix on retry.
-      while [[ -n "$LIST_ERR" ]] && (( attempt < 3 )); do
-        case "$LIST_ERR" in network|5*) ;; *) break ;; esac
-        (( attempt++ ))
-        pk "STATUS Server error while listing folders. Retrying ($attempt of 3)…"
-        /bin/sleep 2
-        pd_list "$lpath"
-      done
+      pd_list_retry "$lpath" "listing folders"
       if [[ -n "$LIST_ERR" ]]; then
+        log "ERROR listing $lpath: $LIST_ERR"
         case "$LIST_ERR" in
           401|402|403) die "Access to the PixelDrain Filesystem was denied (HTTP $LIST_ERR). This feature requires an active Pro subscription." ;;
           404)         die "Folder not found on PixelDrain (HTTP 404)." ;;
           5*)          die "PixelDrain server error while listing folders (HTTP $LIST_ERR). The service is temporarily unavailable. Try again later." ;;
           network)     die "Unable to reach pixeldrain.com while listing folders. Check your network connection." ;;
+          nokey)       die "The API key could not be passed to the upload helper. Re-run install.sh." ;;
           *)           die "Unable to list the PixelDrain Filesystem (error: $LIST_ERR)." ;;
         esac
       fi
@@ -273,6 +357,7 @@ ui_open
 
 [[ "$mode" == move ]] && mode_title="Moving" || mode_title="Copying"
 ui "TITLE $mode_title to ${dest_label}"
+log "=== run start: mode=$mode dest=$dest items=$# ==="
 
 # ---- build the upload plan (one entry per file) ----
 ui "STATUS Scanning files…"
@@ -310,8 +395,18 @@ for rp in "${up_remote[@]}"; do
 done
 ui "STATUS Checking destination…"
 for d in "${dirs_to_list[@]}"; do
-  pd_list "$d"
-  [[ -n "$LIST_ERR" ]] && continue   # 404/absent → nothing here to skip against
+  pd_list_retry "$d" "checking the destination"
+  if [[ -n "$LIST_ERR" ]]; then
+    # 404 is the expected case — the folder doesn't exist yet, so there is
+    # nothing to skip against and make_parents will create it. Any other error
+    # means the skip map is silently incomplete; uploading anyway would redo work
+    # that is already on the server, so stop before touching anything.
+    if [[ "$LIST_ERR" != 404 ]]; then
+      log "ERROR scanning destination $d: $LIST_ERR"
+      die "Unable to check the destination folder on PixelDrain (error: $LIST_ERR). Nothing has been uploaded — try again."
+    fi
+    continue
+  fi
   for fname in "${LIST_FILES[@]}"; do
     remote_size[$d/$fname]="${LIST_FSIZE[$fname]}"
   done
@@ -353,7 +448,9 @@ for (( i = 1; i <= total_files; i++ )); do
 
     /bin/rm -f "$fifo"; /usr/bin/mkfifo "$fifo"
     (( target_exists )) && cur_remote="" || cur_remote="$remote"
-    "$PUT_BIN" fs "$upfile" "$remote" 2>/dev/null > "$fifo" &
+    # stderr goes to the run log, not /dev/null — it is often the only clue when
+    # a file fails for a reason the RESULT line can't express.
+    PD_AUTH_KEY="$API_KEY" "$PUT_BIN" fs "$upfile" "$remote" 2>>"$LOG_FILE" > "$fifo" &
     child_pid=$!
 
     result=""
@@ -374,25 +471,35 @@ for (( i = 1; i <= total_files; i++ )); do
     cur_remote=""
 
     code="${result%% *}"
-    [[ "$code" == 2* || "$code" == 4* ]] && break
-    (( attempt >= 3 )) && break
+    # Success, a 4xx, the helper's permanent -1, or no RESULT line at all (the
+    # helper is missing or not executable) — none of these improve on a retry.
+    [[ "$code" == 2* ]] && break
+    is_transient_upload "$code" || break
+    (( attempt >= RETRY_ATTEMPTS )) && break
     (( attempt++ ))
-    ui "STATUS Server error. Retrying \"$dsp\" ($attempt of 3)…"
+    ui "STATUS Server error. Retrying \"$dsp\" ($attempt of $RETRY_ATTEMPTS)…"
     ui "PROGRESS ind"
-    /bin/sleep 3
+    /bin/sleep "$UPLOAD_RETRY_DELAY"
   done
 
   body="${result#* }"
   if [[ "$code" == 2* ]]; then
     done_names+=("$dsp")
     remote_size[$remote]="$fsize"     # now present → a later identical file skips
+    log "OK $code $remote"
     if [[ "$mode" == move ]]; then
-      /bin/rm -f "$upfile" && (( moved_count++ ))
+      if /bin/rm -f "$upfile"; then
+        (( moved_count++ ))
+      else
+        log "WARN uploaded but could not remove local file: $upfile"
+      fi
     fi
   else
     msg="$(print -r -- "$body" | /usr/bin/sed -n 's/.*"message" *: *"\([^"]*\)".*/\1/p')"
-    [[ -z "$msg" && "$code" == 0 ]] && msg="$body"
+    [[ -z "$msg" && ( "$code" == 0 || "$code" == -1 ) ]] && msg="$body"
+    [[ -z "$msg" && -z "$code" ]] && msg="the upload helper produced no result (re-run install.sh)"
     failed+=("$dsp: ${msg:-HTTP error $code}")
+    log "FAIL ${code:-none} $remote: ${msg:-HTTP error $code}"
   fi
 
   (( bytes_done += fsize ))
@@ -408,10 +515,24 @@ fi
 /bin/rm -rf "$ctldir"
 
 typeset -i uploaded=${#done_names} nskip=${#skipped} nfail=${#failed}
+log "=== run end: uploaded=$uploaded skipped=$nskip failed=$nfail ==="
 
 if (( uploaded > 0 || nskip > 0 )); then
-  print -r -- "https://pixeldrain.com/d/$dest" | /usr/bin/pbcopy
+  # Percent-encoded: a destination containing a space or '#' otherwise yields a
+  # link that silently truncates or 404s when pasted.
+  dest_url="$(pd_encode_path "$dest")"
+  print -r -- "https://pixeldrain.com/d/${dest_url:-$dest}" | /usr/bin/pbcopy
 fi
+
+# With more than one failure the window can only ever name one of them, so point
+# at the log — every failure was written there as it happened.
+fail_detail() {
+  if (( nfail == 1 )); then
+    print -r -- "${failed[1]}"
+  else
+    print -r -- "${failed[1]} — see $LOG_FILE for all $nfail"
+  fi
+}
 
 # Big (folder / many files / >50 MB) → hold the result window open until the user
 # clicks Close. A quick single small file still auto-closes.
@@ -421,7 +542,7 @@ finish() { if (( big )); then ui_done_hold "$1"; else ui_done "$1"; fi }
 
 # Nothing uploaded at all, but there were hard failures → error alert.
 if (( uploaded == 0 && nfail > 0 )); then
-  die "Upload failed. ${failed[1]}"
+  die "Upload failed. $(fail_detail)"
 fi
 
 # Nothing uploaded and nothing failed → everything was already up to date / empty.
@@ -438,7 +559,7 @@ dnoun="files"; (( uploaded == 1 )) && dnoun="file"
 summary="Upload complete. $uploaded $dnoun uploaded to ${dest_label}."
 (( nskip > 0 ))  && summary+=" $nskip already up to date."
 [[ "$mode" == move ]] && summary+=" $moved_count removed from disk."
-(( nfail > 0 ))  && summary+=" $nfail failed (${failed[1]})."
+(( nfail > 0 ))  && summary+=" $nfail failed ($(fail_detail))."
 summary+=" Folder link copied to clipboard."
 finish "$summary"
 notify "Uploaded $uploaded $dnoun to ${dest_label}."

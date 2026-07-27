@@ -339,14 +339,31 @@ final class PickerController: NSObject, NSApplicationDelegate, NSBrowserDelegate
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { resp in
             guard resp == .alertFirstButtonReturn else { return }
-            var name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            name = name.replacingOccurrences(of: "/", with: "")
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return }
+            // "." and ".." survive percent-encoding intact and would walk the
+            // remote path upward; a separator would fabricate nesting the user
+            // never asked for. Reject rather than silently rewrite the name.
+            guard name != ".", name != "..", !name.contains("/") else {
+                DispatchQueue.main.async {
+                    self.rejectName("\"\(name)\" can't be used as a folder name. Names can't contain \"/\" or be \".\" or \"..\".")
+                }
+                return
+            }
             // Present the mode sheet on the next runloop tick so the first sheet
             // has fully dismissed before the second is attached to the window.
             DispatchQueue.main.async { self.confirmMode(for: base, newFolder: name) }
         }
         alert.window.initialFirstResponder = field
+    }
+
+    // Bad new-folder name: say so and stay in the picker so the user can retry.
+    func rejectName(_ msg: String) {
+        let alert = NSAlert()
+        alert.messageText = "Invalid Folder Name"
+        alert.informativeText = msg
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { _ in }
     }
 
     func confirmMode(for base: String, newFolder: String?) {
@@ -358,16 +375,34 @@ final class PickerController: NSObject, NSApplicationDelegate, NSBrowserDelegate
         }
         let alert = NSAlert()
         alert.messageText = "Upload into \(displayPath(dest))?"
-        alert.informativeText = "Copy keeps the originals. Move deletes each local file after it uploads. In both modes, files already in the destination with the same name and size are skipped (Move leaves those on disk)."
+        alert.informativeText = "Copy keeps the originals. Move permanently deletes each local file once it uploads — deleted files do not go to the Trash. In both modes, files already in the destination with the same name and size are skipped (Move leaves those on disk)."
         alert.addButton(withTitle: "Copy")    // default (rightmost)
         alert.addButton(withTitle: "Move")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { resp in
             switch resp {
             case .alertFirstButtonReturn:  self.choose("copy", dest)
-            case .alertSecondButtonReturn: self.choose("move", dest)
+            // Move is the only irreversible choice here, so it gets its own
+            // confirmation. Next runloop tick, so this sheet has fully dismissed
+            // before the second one attaches to the window.
+            case .alertSecondButtonReturn:
+                DispatchQueue.main.async { self.confirmMove(dest) }
             default: break   // Cancel: stay in the picker
             }
+        }
+    }
+
+    // Second gate, Move only. Cancel is added first so it is the default button:
+    // a stray Return on the previous sheet can't start deleting files.
+    func confirmMove(_ dest: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Permanently delete the originals?"
+        alert.informativeText = "Each file is deleted from this Mac as soon as it finishes uploading to \(displayPath(dest)). Files are not moved to the Trash and cannot be recovered."
+        alert.addButton(withTitle: "Cancel")           // default (rightmost)
+        alert.addButton(withTitle: "Move and Delete")
+        alert.beginSheetModal(for: window) { resp in
+            if resp == .alertSecondButtonReturn { self.choose("move", dest) }
         }
     }
 

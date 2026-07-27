@@ -14,12 +14,14 @@ Usage:
 Upload modes print, one per line:
   PROGRESS <0-100>            upload progress
   RESULT <status> <body>     final HTTP status + response body
-  RESULT 0 <error message>   network-level failure
+  RESULT 0 <error message>   transient failure (socket/network) — worth retrying
+  RESULT -1 <error message>  permanent failure (missing file, no key) — do not retry
 
 list prints, one per line:
   DIR  <name>                a subdirectory
   FILE <size> <name>         a file and its size in bytes
-  HTTPERROR <code|network>   on failure (code is the HTTP status)
+  HTTPERROR <code|network>   transient failure (code is the HTTP status)
+  HTTPERROR nokey            permanent failure: PD_AUTH_KEY is unset
 """
 import http.client
 import json
@@ -32,6 +34,15 @@ import urllib.request
 CHUNK = 1024 * 1024
 HOST = "pixeldrain.com"
 
+# RESULT codes for the two failure classes the orchestrator treats differently.
+TRANSIENT = 0
+PERMANENT = -1
+
+
+class ShortFileError(Exception):
+    """The file shrank after its size was measured, so the body can no longer
+    match the Content-Length already sent. The connection is unusable."""
+
 
 def emit(line):
     print(line, flush=True)
@@ -40,7 +51,7 @@ def emit(line):
 def get_key():
     key = os.environ.get("PD_AUTH_KEY", "").strip()
     if not key:
-        emit("RESULT 0 PD_AUTH_KEY not set")
+        emit(f"RESULT {PERMANENT} PD_AUTH_KEY not set")
         sys.exit(1)
     return key
 
@@ -49,10 +60,30 @@ def encode_path(path):
     return "/".join(urllib.parse.quote(s) for s in path.split("/"))
 
 
+def format_listing(data):
+    """Turn a ?stat response into the DIR/FILE lines of the list protocol.
+
+    Directories first, then files, each sorted case-insensitively by name.
+    Pure — no I/O — so it can be tested against fixture responses.
+    """
+    children = data.get("children") or []
+    dirs = sorted(
+        (c["name"] for c in children if c.get("type") == "dir" and c.get("name")),
+        key=str.lower,
+    )
+    files = sorted(
+        ((c["name"], int(c.get("file_size") or 0))
+         for c in children if c.get("type") != "dir" and c.get("name")),
+        key=lambda t: t[0].lower(),
+    )
+    return [f"DIR {n}" for n in dirs] + [f"FILE {sz} {n}" for n, sz in files]
+
+
 def do_list(path):
     key = os.environ.get("PD_AUTH_KEY", "").strip()
     if not key:
-        emit("HTTPERROR network")
+        # Permanent: retrying without a key will never succeed.
+        emit("HTTPERROR nokey")
         return
     req = urllib.request.Request(
         f"https://{HOST}/api/filesystem/{encode_path(path)}?stat",
@@ -68,26 +99,18 @@ def do_list(path):
         emit("HTTPERROR network")
         return
 
-    children = data.get("children") or []
-    dirs = sorted(
-        (c["name"] for c in children if c.get("type") == "dir" and c.get("name")),
-        key=str.lower,
-    )
-    files = sorted(
-        ((c["name"], int(c.get("file_size") or 0))
-         for c in children if c.get("type") != "dir" and c.get("name")),
-        key=lambda t: t[0].lower(),
-    )
-    for n in dirs:
-        emit(f"DIR {n}")
-    for n, sz in files:
-        emit(f"FILE {sz} {n}")
+    for line in format_listing(data):
+        emit(line)
 
 
 def do_upload(mode, local_file, remote):
-    get_key()  # validate presence early
-    key = os.environ["PD_AUTH_KEY"].strip()
-    size = os.path.getsize(local_file)
+    key = get_key()  # exits with RESULT -1 when unset
+    try:
+        size = os.path.getsize(local_file)
+    except OSError as e:
+        # Unreadable/missing/vanished source — no amount of retrying helps.
+        emit(f"RESULT {PERMANENT} {type(e).__name__}: {e}")
+        return
     cookie = "pd_auth_key=" + key
 
     # Raw PUT for both modes, as recommended by the PixelDrain API docs.
@@ -117,33 +140,47 @@ def do_upload(mode, local_file, remote):
                 emit(f"PROGRESS {pct}")
                 last_pct = pct
 
+        # Send exactly Content-Length bytes. A file that grew mid-upload is
+        # truncated to the declared length (the request stays well-formed); one
+        # that shrank cannot be salvaged, since the header is already on the wire.
         with open(local_file, "rb") as f:
-            while True:
-                block = f.read(CHUNK)
+            while sent < total:
+                block = f.read(min(CHUNK, total - sent))
                 if not block:
-                    break
+                    raise ShortFileError(
+                        f"file changed size during upload "
+                        f"(declared {total} bytes, read {sent})"
+                    )
                 send(block)
 
         resp = conn.getresponse()
         body = resp.read(65536).decode("utf-8", "replace").replace("\n", " ")
         emit(f"RESULT {resp.status} {body}")
+    except ShortFileError as e:
+        emit(f"RESULT {PERMANENT} {e}")
     except Exception as e:
-        emit(f"RESULT 0 {type(e).__name__}: {e}")
+        emit(f"RESULT {TRANSIENT} {type(e).__name__}: {e}")
     finally:
         conn.close()
 
 
 def main():
     if len(sys.argv) < 2:
-        emit("RESULT 0 usage: pixeldrain-put <fs|file|list> ...")
+        emit(f"RESULT {PERMANENT} usage: pixeldrain-put <fs|file|list> ...")
         sys.exit(1)
     mode = sys.argv[1]
     if mode == "list":
+        if len(sys.argv) < 3:
+            emit("HTTPERROR nokey")
+            sys.exit(1)
         do_list(sys.argv[2])
     elif mode in ("fs", "file"):
+        if len(sys.argv) < 4:
+            emit(f"RESULT {PERMANENT} usage: pixeldrain-put {mode} <local> <remote>")
+            sys.exit(1)
         do_upload(mode, sys.argv[2], sys.argv[3])
     else:
-        emit(f"RESULT 0 unknown mode: {mode}")
+        emit(f"RESULT {PERMANENT} unknown mode: {mode}")
         sys.exit(1)
 
 
