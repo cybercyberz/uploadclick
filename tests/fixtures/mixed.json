@@ -1,0 +1,13 @@
+{
+  "path": [{ "name": "me", "type": "dir" }],
+  "base_index": 0,
+  "children": [
+    { "name": "zebra", "type": "dir" },
+    { "name": "Photos", "type": "dir" },
+    { "name": "apple", "type": "dir" },
+    { "name": "report final.pdf", "type": "file", "file_size": 204800 },
+    { "name": "Archive.zip", "type": "file", "file_size": 1073741824 },
+    { "name": "notes.txt", "type": "file", "file_size": 0 },
+    { "name": "no-size.bin", "type": "file", "file_size": null }
+  ]
+}

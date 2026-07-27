@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    # macOS-native throughout: zsh, /usr/bin/python3 and swiftc are the same
+    # toolchain the Quick Action depends on at runtime.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          zsh -n install.sh
+          zsh -n bin/pixeldrain-upload-fs
+          zsh -n tests/run.sh
+
+      - name: Python syntax
+        run: python3 -m py_compile bin/pixeldrain-put
+
+      - name: Swift typecheck
+        run: |
+          xcrun swiftc -typecheck src/pixeldrain-picker.swift
+          xcrun swiftc -typecheck src/pixeldrain-progress.swift
+
+      - name: Unit tests
+        run: |
+          ./tests/run.sh
+          python3 -m unittest discover -s tests -v
+
+      - name: Build the AppKit helpers
+        run: ./install.sh build
+
+      # The committed binaries let people install without a Swift toolchain, so
+      # they must not drift from src/. install.sh records the source hashes it
+      # built from; this fails if the checked-in pair is stale.
+      - name: Committed binaries match src/
+        run: ./install.sh check-binaries
